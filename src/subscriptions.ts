@@ -1,4 +1,6 @@
 import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { parse } from "smol-toml";
 import type { UsageService } from "./types.js";
 
@@ -247,4 +249,22 @@ export function enabledUsageServices(inventory: SubscriptionsInventory): Set<Usa
     if (worker.usageService) services.add(worker.usageService);
   }
   return services;
+}
+
+
+/**
+ * Where the inventory lives by default.
+ *
+ * A user-level path, because the file describes the machine's subscriptions
+ * rather than any one project's. Both consumers already read this same file —
+ * my-claw did so by reimplementing the path, which is the kind of shared
+ * knowledge that drifts silently, so it lives here now.
+ */
+export function subscriptionsManifestPath(env: NodeJS.ProcessEnv = process.env): string {
+  const configured = env.LEARNWHALE_AUTOMATION_META_LOOP_SUBSCRIPTIONS_PATH?.trim();
+  if (configured) {
+    return configured;
+  }
+  const configHome = env.XDG_CONFIG_HOME?.trim() || join(homedir(), ".config");
+  return join(configHome, "learnwhale", "subscriptions.toml");
 }
