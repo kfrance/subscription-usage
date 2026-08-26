@@ -40,4 +40,32 @@ describe("CursorUsageProvider", () => {
     });
     expect((await failed.getUsage()).unavailableReason).toMatch(/returned 401/);
   });
+
+  it("keeps usable usage when the optional plan RPC fails", async () => {
+    // The plan call supplies a tier label and a fallback reset; the usage call
+    // already carries the percentages and its own cycle end. A transient failure
+    // of the former should not discard the latter.
+    const resetsAt = Date.now() + 7 * 24 * 60 * 60 * 1000;
+
+    const provider = new CursorUsageProvider({
+      authPath: "/auth.json",
+      readFile: () => JSON.stringify({ accessToken: "token" }),
+      fetchImpl: (async (url: string) =>
+        String(url).includes("GetPlanInfo")
+          ? new Response("nope", { status: 503 })
+          : new Response(
+              JSON.stringify({
+                billingCycleEnd: String(resetsAt),
+                planUsage: { totalPercentUsed: 37 },
+              }),
+              { status: 200 },
+            )) as unknown as typeof fetch,
+    });
+
+    const snapshot = await provider.getUsage();
+
+    expect(snapshot.unavailableReason).toBeUndefined();
+    expect(snapshot.planType).toBe("");
+    expect(snapshot.windows.find((window) => window.label === "monthly")?.usedPercent).toBe(37);
+  });
 });

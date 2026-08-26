@@ -358,6 +358,76 @@ describe("CachingUsageProvider stale readings", () => {
     expect(snapshot.unavailableReason).toContain("rate limited");
   });
 
+  it("keeps a valid weekly window after the 5h window in the same reading resets", async () => {
+    // Claude and Codex report both windows in one reading. The 5h window
+    // resetting says nothing about the weekly one, and discarding the whole
+    // reading blanked a panel holding a perfectly good weekly figure.
+    const inner = fakeInner([unavailableSnapshot("claude", "offline")]);
+    const disk = fakeDisk(cacheFile({
+      snapshot: {
+        service: "claude",
+        planType: "max",
+        capturedAt: T0 - 30 * MINUTE,
+        windows: [
+          { label: "5h", usedPercent: 88, resetsAt: T0 - MINUTE },
+          { label: "weekly", usedPercent: 21, resetsAt: T0 + 3 * 24 * 60 * MINUTE },
+        ],
+      },
+    }));
+    const provider = makeProvider(inner, disk, {
+      freshMs: 2 * MINUTE,
+      staleCeilingMs: 6 * 60 * MINUTE,
+    });
+
+    const snapshot = await provider.getUsage();
+
+    expect(snapshot.unavailableReason).toBeUndefined();
+    expect(snapshot.windows.map((window) => window.label)).toEqual(["weekly"]);
+    expect(snapshot.windows[0]?.usedPercent).toBe(21);
+    expect(snapshot.refreshError).toContain("offline");
+  });
+
+  it("refuses the reading once every window in it has reset", async () => {
+    const inner = fakeInner([unavailableSnapshot("claude", "offline")]);
+    const disk = fakeDisk(cacheFile({
+      snapshot: {
+        service: "claude",
+        planType: "max",
+        capturedAt: T0 - 30 * MINUTE,
+        windows: [{ label: "5h", usedPercent: 88, resetsAt: T0 - MINUTE }],
+      },
+    }));
+    const provider = makeProvider(inner, disk, {
+      freshMs: 2 * MINUTE,
+      staleCeilingMs: 6 * 60 * MINUTE,
+    });
+
+    expect((await provider.getUsage()).unavailableReason).toContain("offline");
+  });
+
+  it("does not serve a partially reset reading as current", async () => {
+    // The strict rule still governs the fresh path: a caller that gates spending
+    // must never be handed an incomplete window set dressed as a live reading.
+    const inner = fakeInner([goodSnapshot(13)]);
+    const disk = fakeDisk(cacheFile({
+      snapshot: {
+        service: "claude",
+        planType: "max",
+        capturedAt: T0 - MINUTE,
+        windows: [
+          { label: "5h", usedPercent: 88, resetsAt: T0 - 1_000 },
+          { label: "weekly", usedPercent: 21, resetsAt: T0 + 3 * 24 * 60 * MINUTE },
+        ],
+      },
+    }));
+    const provider = makeProvider(inner, disk, { freshMs: 2 * MINUTE });
+
+    const snapshot = await provider.getUsage();
+
+    expect(inner.calls).toBe(1);
+    expect(snapshot.windows.map((window) => window.label)).toEqual(["5h"]);
+  });
+
   it("still refuses a stale reading whose window has already reset", async () => {
     // A reset only lowers utilization, so a reading taken before one overstates
     // spend. Serving it as stale would be worse than saying nothing.

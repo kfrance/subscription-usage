@@ -86,16 +86,16 @@ export class CursorUsageProvider implements UsageProvider {
           httpFailureKind(usageResponse.status),
         );
       }
-      if (!planResponse.ok) {
-        return unavailableSnapshot(
-          "cursor",
-          `Cursor plan RPC returned ${planResponse.status}`,
-          httpFailureKind(planResponse.status),
-        );
-      }
-
       const usage = await readJson<CursorUsagePayload>(usageResponse, "usage");
-      const plan = await readJson<CursorPlanPayload>(planResponse, "plan");
+      // The plan call supplies the tier label and a fallback reset instant, both
+      // optional: `planType` is documented as "" when unavailable, and the usage
+      // payload normally carries its own `billingCycleEnd`. Treating a failure
+      // here as fatal discarded complete, usable percentages over missing
+      // metadata. If the usage payload also lacks a reset, normalization reports
+      // the snapshot unavailable on its own.
+      const plan = planResponse.ok
+        ? await readJson<CursorPlanPayload>(planResponse, "plan").catch(() => ({}))
+        : {};
       return normalizeCursorUsage(usage, plan);
     } catch (error) {
       return unavailableSnapshot("cursor", `Cursor usage request failed: ${describeError(error)}`);

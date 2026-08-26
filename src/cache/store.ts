@@ -184,7 +184,7 @@ export class CachingUsageProvider implements UsageProvider {
     // a before reading against an after reading, so it needs a live one.
     const stored = entry?.snapshot;
     const decision = this.freshness(stored, now);
-    if (decision.use === "cached" && isServable(stored, now)) {
+    if (decision.use === "cached" && isCurrent(stored, now)) {
       return stored;
     }
 
@@ -195,8 +195,11 @@ export class CachingUsageProvider implements UsageProvider {
       // The backoff says do not ask again; it does not say forget what we know.
       // A caller that accepts stale readings should keep seeing the stored one
       // for the whole backoff, not just on the call that armed it.
-      if (decision.use === "refresh" && decision.staleOk && isServable(stored, now)) {
-        return { ...stored, refreshError: reason };
+      const stale = decision.use === "refresh" && decision.staleOk
+        ? staleReading(stored, now)
+        : undefined;
+      if (stale) {
+        return { ...stale, refreshError: reason };
       }
       return unavailableSnapshot(this.service, reason, "rate-limited");
     }
@@ -213,8 +216,11 @@ export class CachingUsageProvider implements UsageProvider {
       lock = this.acquireLock(this.lockPath(), `${this.service} usage fetch`);
     } catch {
       const reason = "another process is reading usage";
-      if (decision.use === "refresh" && decision.staleOk && isServable(stored, now)) {
-        return { ...stored, refreshError: reason };
+      const stale = decision.use === "refresh" && decision.staleOk
+        ? staleReading(stored, now)
+        : undefined;
+      if (stale) {
+        return { ...stale, refreshError: reason };
       }
       return unavailableSnapshot(this.service, reason);
     }
@@ -228,7 +234,7 @@ export class CachingUsageProvider implements UsageProvider {
       const current = this.readEntry();
       const currentSnapshot = current?.snapshot;
       const lockedDecision = this.freshness(currentSnapshot, lockedNow);
-      if (lockedDecision.use === "cached" && isServable(currentSnapshot, lockedNow)) {
+      if (lockedDecision.use === "cached" && isCurrent(currentSnapshot, lockedNow)) {
         return currentSnapshot;
       }
 
@@ -239,9 +245,11 @@ export class CachingUsageProvider implements UsageProvider {
       if (current?.blockedUntil !== undefined && current.blockedUntil > lockedNow) {
         const waitSeconds = Math.ceil((current.blockedUntil - lockedNow) / 1000);
         const reason = `rate limited; not retrying for ${waitSeconds}s`;
-        if (lockedDecision.use === "refresh" && lockedDecision.staleOk
-          && isServable(currentSnapshot, lockedNow)) {
-          return { ...currentSnapshot, refreshError: reason };
+        const stale = lockedDecision.use === "refresh" && lockedDecision.staleOk
+          ? staleReading(currentSnapshot, lockedNow)
+          : undefined;
+        if (stale) {
+          return { ...stale, refreshError: reason };
         }
         return unavailableSnapshot(this.service, reason, "rate-limited");
       }
@@ -264,9 +272,18 @@ export class CachingUsageProvider implements UsageProvider {
         // tagged with what went wrong, so a panel can show figures and say they
         // are not current. Callers that gate spending do not set `staleOk`, so
         // they still see the failure.
-        if (lockedDecision.use === "refresh" && lockedDecision.staleOk
-          && isServable(currentSnapshot, lockedNow)) {
-          return { ...currentSnapshot, refreshError: snapshot.unavailableReason };
+        // Re-sample the clock: the request we just awaited may have taken
+        // seconds, and the stored reading can have crossed the caller's
+        // staleness ceiling or had a window reset while we waited. Judging it by
+        // the instant we started would hand back a reading that is no longer
+        // eligible at the moment we return it.
+        const afterNow = this.now();
+        const afterDecision = this.freshness(currentSnapshot, afterNow);
+        const stale = afterDecision.use === "refresh" && afterDecision.staleOk
+          ? staleReading(currentSnapshot, afterNow)
+          : undefined;
+        if (stale) {
+          return { ...stale, refreshError: snapshot.unavailableReason };
         }
         return snapshot;
       }
@@ -361,22 +378,48 @@ function writeCacheEntry(
 }
 
 /**
- * A stored reading is usable at all: it is a real reading rather than a recorded
- * failure, it knows when it was taken, and none of its windows has reset since.
- *
- * The reset check matters independently of age. A reset only ever lowers
- * utilization, so a reading taken before one overstates how much has been spent,
- * and it does so at the exact moment a full window has just become available.
- * Age is not consulted here — that is the caller's policy to decide.
+ * A stored reading is a real reading rather than a recorded failure, and it
+ * knows when it was taken. Says nothing about whether its figures still apply.
  */
-function isServable(snapshot: UsageSnapshot | undefined, now: number): snapshot is UsageSnapshot {
-  if (snapshot?.capturedAt === undefined) {
-    return false;
+function isReading(snapshot: UsageSnapshot | undefined): snapshot is UsageSnapshot {
+  return (
+    snapshot?.capturedAt !== undefined &&
+    !snapshot.unavailableReason &&
+    snapshot.windows.length > 0
+  );
+}
+
+/**
+ * A stored reading that can stand in for a current one: every window it carries
+ * is still the window it was measured against.
+ *
+ * A reset only ever lowers utilization, so a reading taken before one overstates
+ * how much has been spent — and it does so at the exact moment a full window has
+ * just become available. Serving that as if it were current would understate
+ * capacity to a caller that gates spending, so any reset disqualifies the whole
+ * reading here. Age is not consulted; that is the caller's policy to decide.
+ */
+function isCurrent(snapshot: UsageSnapshot | undefined, now: number): snapshot is UsageSnapshot {
+  return isReading(snapshot) && now < earliestReset(snapshot);
+}
+
+/**
+ * The reading with reset windows removed, for a caller that asked for stale
+ * figures, or undefined when nothing usable is left.
+ *
+ * Windows are independent measurements: a Claude reading carries both a 5-hour
+ * and a weekly window, and the 5-hour one resetting says nothing about the
+ * weekly one. Discarding the whole reading there would blank a panel that holds
+ * a perfectly good weekly figure and explicitly asked to keep showing one. The
+ * result is only ever handed back tagged with `refreshError`, so its figures are
+ * already presented as not current.
+ */
+function staleReading(snapshot: UsageSnapshot | undefined, now: number): UsageSnapshot | undefined {
+  if (!isReading(snapshot)) {
+    return undefined;
   }
-  if (snapshot.unavailableReason || snapshot.windows.length === 0) {
-    return false;
-  }
-  return now < earliestReset(snapshot);
+  const windows = snapshot.windows.filter((window) => window.resetsAt === 0 || now < window.resetsAt);
+  return windows.length > 0 ? { ...snapshot, windows } : undefined;
 }
 
 /**
