@@ -9,7 +9,7 @@ import {
   type UsageSnapshot,
   type UsageService,
 } from "../types.js";
-import { describeError, isRecord } from "../lib/values.js";
+import { describeError, isRecord, percentInRange } from "../lib/values.js";
 
 /**
  * A caching decorator for any `UsageProvider`, and the single place the freshness
@@ -527,8 +527,13 @@ function isCachedSnapshot(value: unknown): value is UsageSnapshot {
       (window) =>
         isRecord(window) &&
         typeof window.label === "string" &&
-        typeof window.usedPercent === "number" &&
-        typeof window.resetsAt === "number",
+        // The same 0-100 bound every provider applies. A cache file is editable
+        // and can be corrupt, and a negative utilization reads as spare capacity
+        // to the rail that decides whether to dispatch work, so an out-of-range
+        // value has to make the file a miss rather than a reading.
+        percentInRange(window.usedPercent) !== undefined &&
+        typeof window.resetsAt === "number" &&
+        Number.isFinite(window.resetsAt),
     )
   );
 }
@@ -616,8 +621,10 @@ export function invalidateCachedReading(
     return;
   }
 
-  if (entry?.snapshot !== undefined) {
-    const { snapshot: _dropped, version: _version, ...kept } = entry;
-    writeCacheEntry(path, kept, write, remove);
-  }
+  // The entry is deliberately left alone. The cutoff already disqualifies every
+  // reading captured before it, so deleting the snapshot would buy nothing — and
+  // this runs without the service lock, so a rewrite based on the entry read
+  // above would delete a trustworthy reading another process wrote in between,
+  // costing a live request against a rate-limited endpoint. A superseded reading
+  // stays on disk, unservable, until the next success overwrites it.
 }

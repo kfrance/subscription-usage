@@ -122,4 +122,19 @@ describe("CodexUsageProvider", () => {
       unavailableReason: "timeout after 5000ms",
     });
   });
+
+  it("reports a rejected probe as unavailable instead of throwing", async () => {
+    // Every provider here answers with a snapshot, never an exception. spawn
+    // throws synchronously for an invalid command, so this path is reachable
+    // without any injection at all.
+    const provider = new CodexUsageProvider({
+      codexCommand: "codex",
+      getRateLimits: () => Promise.reject(new Error("spawn ENOENT")),
+    });
+
+    const snapshot = await provider.getUsage();
+
+    expect(snapshot.unavailableReason).toContain("spawn ENOENT");
+    expect(snapshot.windows).toEqual([]);
+  });
 });

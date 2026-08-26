@@ -428,6 +428,27 @@ describe("CachingUsageProvider stale readings", () => {
     expect(snapshot.windows.map((window) => window.label)).toEqual(["5h"]);
   });
 
+  it("treats an out-of-range utilization in the cache file as a miss", async () => {
+    // Cache files are editable and can be corrupt. A negative utilization reads
+    // as spare capacity to the rail that decides whether to dispatch, so it has
+    // to fail closed rather than be served as a recent reading.
+    const inner = fakeInner([goodSnapshot(13)]);
+    const disk = fakeDisk(cacheFile({
+      snapshot: {
+        service: "claude",
+        planType: "max",
+        capturedAt: T0 - 1_000,
+        windows: [{ label: "weekly", usedPercent: -1, resetsAt: T0 + 3 * 24 * 60 * MINUTE }],
+      },
+    }));
+    const provider = makeProvider(inner, disk, { freshMs: 2 * MINUTE });
+
+    const snapshot = await provider.getUsage();
+
+    expect(inner.calls).toBe(1);
+    expect(snapshot.windows[0]?.usedPercent).toBe(13);
+  });
+
   it("still refuses a stale reading whose window has already reset", async () => {
     // A reset only lowers utilization, so a reading taken before one overstates
     // spend. Serving it as stale would be worse than saying nothing.
@@ -648,7 +669,7 @@ describe("invalidateCachedReading", () => {
     expect(snapshot.windows).toEqual([]);
   });
 
-  it("drops the reading but keeps the backoff", () => {
+  it("makes the reading unservable while keeping the backoff", async () => {
     const disk = fakeDisk(
       cacheFile({
         snapshot: { ...goodSnapshot(42), capturedAt: T0 - MINUTE },
@@ -663,9 +684,22 @@ describe("invalidateCachedReading", () => {
       writeFileAtomic: (path, data) => disk.writeFileAtomic(path, data),
     });
 
-    expect(disk.entry()?.snapshot).toBeUndefined();
+    // The entry file is left alone on purpose: the cutoff is what disqualifies
+    // the reading, and rewriting the entry without the service lock would risk
+    // deleting a trustworthy reading another process wrote in the meantime.
     expect(disk.entry()?.blockedUntil).toBe(T0 + MINUTE);
     expect(disk.entry()?.consecutiveFailures).toBe(2);
+
+    // What matters is that the reading can no longer be served, backoff or not.
+    const inner = fakeInner([unavailableSnapshot("claude", "offline")]);
+    const provider = makeProvider(inner, disk, {
+      now: T0 + 2 * MINUTE,
+      freshMs: 10 * MINUTE,
+      staleCeilingMs: 6 * 60 * MINUTE,
+    });
+    const snapshot = await provider.getUsage();
+    expect(snapshot.windows).toEqual([]);
+    expect(snapshot.unavailableReason).toContain("offline");
   });
 
   it("makes the next read fail closed while the backoff is still armed", async () => {
