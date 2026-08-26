@@ -232,6 +232,20 @@ export class CachingUsageProvider implements UsageProvider {
         return currentSnapshot;
       }
 
+      // Another process may have taken a 429 and armed a backoff between the
+      // read above and this lock. Re-checking here is what makes the backoff
+      // shared: without it a caller that always refreshes would ask the vendor
+      // again immediately and deepen the limit the other process just hit.
+      if (current?.blockedUntil !== undefined && current.blockedUntil > lockedNow) {
+        const waitSeconds = Math.ceil((current.blockedUntil - lockedNow) / 1000);
+        const reason = `rate limited; not retrying for ${waitSeconds}s`;
+        if (lockedDecision.use === "refresh" && lockedDecision.staleOk
+          && isServable(currentSnapshot, lockedNow)) {
+          return { ...currentSnapshot, refreshError: reason };
+        }
+        return unavailableSnapshot(this.service, reason, "rate-limited");
+      }
+
       let snapshot: UsageSnapshot;
       try {
         snapshot = await this.inner.getUsage();

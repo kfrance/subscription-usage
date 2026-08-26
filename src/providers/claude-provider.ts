@@ -161,28 +161,41 @@ export class ClaudeUsageProvider implements UsageProvider {
    * carrying a `retryAfter` deadline, and the caller decides when to ask again.
    */
   private async fetchUsage(token: string): Promise<unknown> {
-    const response = await this.requestUsage(token, REQUEST_TIMEOUT_MS);
-    if (response.ok) {
-      return response.json();
-    }
+    return this.requestUsage(token, REQUEST_TIMEOUT_MS, async (response) => {
+      if (response.ok) {
+        return response.json();
+      }
 
-    if (response.status === 429) {
-      throw new UsageRequestError("usage request failed: HTTP 429", "rate-limited", {
-        retryAfter: retryAfterDeadline(response.headers.get("retry-after"), this.now()),
-      });
-    }
+      if (response.status === 429) {
+        throw new UsageRequestError("usage request failed: HTTP 429", "rate-limited", {
+          retryAfter: retryAfterDeadline(response.headers.get("retry-after"), this.now()),
+        });
+      }
 
-    throw new UsageRequestError(
-      `usage request failed: HTTP ${response.status}`,
-      httpFailureKind(response.status),
-    );
+      throw new UsageRequestError(
+        `usage request failed: HTTP ${response.status}`,
+        httpFailureKind(response.status),
+      );
+    });
   }
 
-  private async requestUsage(token: string, timeoutMs: number): Promise<Response> {
+  /**
+   * Run the request and consume its body under one deadline.
+   *
+   * The timer covers `consume` as well as the fetch, because a server that sends
+   * headers and then stalls the body would otherwise hold this request open
+   * indefinitely: aborting only on headers leaves the read unbounded, and the
+   * caller holds the service cache lock while it waits.
+   */
+  private async requestUsage<T>(
+    token: string,
+    timeoutMs: number,
+    consume: (response: Response) => Promise<T>,
+  ): Promise<T> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      return await this.fetchImpl(USAGE_URL, {
+      const response = await this.fetchImpl(USAGE_URL, {
         method: "GET",
         headers: {
           Authorization: `Bearer ${token}`,
@@ -190,6 +203,7 @@ export class ClaudeUsageProvider implements UsageProvider {
         },
         signal: controller.signal,
       });
+      return await consume(response);
     } finally {
       clearTimeout(timer);
     }

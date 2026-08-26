@@ -328,6 +328,36 @@ describe("CachingUsageProvider stale readings", () => {
     expect(snapshot.refreshError).toContain("another process");
   });
 
+  it("respects a backoff another process armed while we waited for the lock", async () => {
+    // The pre-lock read saw no backoff; the entry visible under the lock has one.
+    // Missing it would send a force-refresh caller straight at a vendor that
+    // just rate-limited someone else.
+    const inner = fakeInner([goodSnapshot(13)]);
+    const disk = fakeDisk(cacheFile({ snapshot: { ...goodSnapshot(42), capturedAt: T0 - 5 * MINUTE } }));
+    let handedOut = false;
+    const provider = makeProvider(inner, disk, {
+      freshMs: 0,
+      acquireLock: () => {
+        // Simulate the other process finishing between our read and our lock.
+        disk.writeFileAtomic(
+          CLAUDE_PATH,
+          cacheFile({
+            snapshot: { ...goodSnapshot(42), capturedAt: T0 - 5 * MINUTE },
+            blockedUntil: T0 + 2 * MINUTE,
+          }),
+        );
+        handedOut = true;
+        return { lockPath: `${CACHE_DIR}/claude.lock`, release: () => undefined };
+      },
+    });
+
+    const snapshot = await provider.getUsage();
+
+    expect(handedOut).toBe(true);
+    expect(inner.calls).toBe(0);
+    expect(snapshot.unavailableReason).toContain("rate limited");
+  });
+
   it("still refuses a stale reading whose window has already reset", async () => {
     // A reset only lowers utilization, so a reading taken before one overstates
     // spend. Serving it as stale would be worse than saying nothing.

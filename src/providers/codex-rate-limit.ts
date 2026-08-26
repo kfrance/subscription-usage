@@ -1,6 +1,15 @@
 import { spawn } from "node:child_process";
 import { isRecord } from "../lib/values.js";
 
+/**
+ * How this probe identifies itself to the Codex app server.
+ *
+ * Names the package rather than either consumer: both applications share this
+ * code now, and the previous value announced one of them to the other's server.
+ */
+const CLIENT_NAME = "subscription-usage";
+const CLIENT_TITLE = "Subscription usage";
+
 export interface CodexRateLimitWindowSnapshot {
   label: "5h" | "weekly";
   usedPercent: number;
@@ -139,8 +148,8 @@ export function buildCodexInitializeRequest(): Record<string, unknown> {
     method: "initialize",
     params: {
       clientInfo: {
-        name: "learnwhale-test-effectiveness",
-        title: "LearnWhale test effectiveness",
+        name: CLIENT_NAME,
+        title: CLIENT_TITLE,
         version: "0.1.0",
       },
       capabilities: {
@@ -192,13 +201,16 @@ export function parseRateLimitSnapshot(stdout: string): CodexRateLimitSnapshot |
       (window): window is CodexRateLimitWindowSnapshot => window !== undefined,
     );
 
-    if (windows.length === 0 || typeof planType !== "string" || planType.trim().length === 0) {
+    if (windows.length === 0) {
       continue;
     }
 
+    // The plan tier is optional metadata; the windows are the reading. Requiring
+    // a tier discarded an otherwise valid response and made the service look
+    // unavailable, and every consumer already renders an empty tier as unknown.
     return {
       windows,
-      planType,
+      planType: typeof planType === "string" ? planType : "",
     };
   }
 
