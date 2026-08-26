@@ -1,0 +1,9 @@
+{
+  "name": "@kfrance/subscription-usage",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./types": "./src/types.ts"
+  }
+}
