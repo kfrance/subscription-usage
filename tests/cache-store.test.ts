@@ -307,6 +307,27 @@ describe("CachingUsageProvider stale readings", () => {
     expect(snapshot.windows).toEqual([]);
   });
 
+  it("keeps serving the stored reading while another process holds the lock", async () => {
+    // Contention is routine now that two applications share this cache, so it
+    // must not blank a panel that asked for stale figures over none.
+    const inner = fakeInner([]);
+    const disk = fakeDisk(cachedReading(T0 - 5 * MINUTE, 42));
+    const provider = makeProvider(inner, disk, {
+      freshMs: 2 * MINUTE,
+      staleCeilingMs: 6 * 60 * MINUTE,
+      acquireLock: () => {
+        throw new Error("held");
+      },
+    });
+
+    const snapshot = await provider.getUsage();
+
+    expect(inner.calls).toBe(0);
+    expect(snapshot.unavailableReason).toBeUndefined();
+    expect(snapshot.windows[0]?.usedPercent).toBe(42);
+    expect(snapshot.refreshError).toContain("another process");
+  });
+
   it("still refuses a stale reading whose window has already reset", async () => {
     // A reset only lowers utilization, so a reading taken before one overstates
     // spend. Serving it as stale would be worse than saying nothing.

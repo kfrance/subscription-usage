@@ -202,13 +202,21 @@ export class CachingUsageProvider implements UsageProvider {
     }
 
     // Another process is already fetching this service. Joining it would be the
-    // very burst this cache exists to prevent, so report unavailable instead of
-    // piling on; the next command picks up the reading that process writes.
+    // very burst this cache exists to prevent, so do not pile on; the next call
+    // picks up the reading that process writes.
+    //
+    // Contention is normal here rather than exceptional, because two
+    // applications share this cache, so treat it as a failed refresh rather than
+    // as an erasure: a caller that accepts stale readings keeps its stored one.
     let lock: LockHandle;
     try {
       lock = this.acquireLock(this.lockPath(), `${this.service} usage fetch`);
     } catch {
-      return unavailableSnapshot(this.service, "another process is reading usage");
+      const reason = "another process is reading usage";
+      if (decision.use === "refresh" && decision.staleOk && isServable(stored, now)) {
+        return { ...stored, refreshError: reason };
+      }
+      return unavailableSnapshot(this.service, reason);
     }
 
     try {

@@ -8,6 +8,7 @@ import {
   unavailableSnapshot,
   type UsageProvider,
   type UsageSnapshot,
+  type UsageUnavailableKind,
 } from "../types.js";
 import { describeError, isRecord, percentInRange } from "../lib/values.js";
 
@@ -113,7 +114,7 @@ export class GrokUsageProvider implements UsageProvider {
     if (this.needsRefresh(parsed.entry)) {
       const refreshed = await this.refresh(parsed);
       if (refreshed.unavailableReason) {
-        return unavailableSnapshot("grok", refreshed.unavailableReason);
+        return unavailableSnapshot("grok", refreshed.unavailableReason, refreshed.unavailableKind);
       }
       accessToken = refreshed.accessToken;
     }
@@ -170,7 +171,7 @@ export class GrokUsageProvider implements UsageProvider {
     raw: Record<string, unknown>;
     topKey: string;
     entry: GrokAuthEntry;
-  }): Promise<{ accessToken: string; unavailableReason?: string }> {
+  }): Promise<{ accessToken: string; unavailableReason?: string; unavailableKind?: UsageUnavailableKind }> {
     const existingToken = typeof parsed.entry.key === "string" ? parsed.entry.key : "";
 
     let lock: LockHandle;
@@ -210,7 +211,11 @@ export class GrokUsageProvider implements UsageProvider {
       const tokenResponse = await this.requestToken(issuer, refreshToken, clientId);
       if (!tokenResponse.ok) {
         // Leave the file UNCHANGED on failure.
-        return { accessToken: "", unavailableReason: tokenResponse.unavailableReason };
+        return {
+          accessToken: "",
+          unavailableReason: tokenResponse.unavailableReason,
+          unavailableKind: tokenResponse.unavailableKind,
+        };
       }
       const { accessToken, newRefreshToken, expiresInSec } = tokenResponse;
 
@@ -240,7 +245,7 @@ export class GrokUsageProvider implements UsageProvider {
     clientId: string,
   ): Promise<
     | { ok: true; accessToken: string; newRefreshToken: string; expiresInSec: number }
-    | { ok: false; unavailableReason: string }
+    | { ok: false; unavailableReason: string; unavailableKind?: UsageUnavailableKind }
   > {
     const tokenUrl = `${issuer.replace(/\/$/, "")}/oauth2/token`;
     const body = new URLSearchParams({
@@ -259,7 +264,13 @@ export class GrokUsageProvider implements UsageProvider {
         signal: controller.signal,
       });
       if (!response.ok) {
-        return { ok: false, unavailableReason: `grok token endpoint returned ${response.status}` };
+        // A rate limit here has to reach the cache, or every command retries the
+        // refresh immediately and deepens the limit the cache exists to avoid.
+        return {
+          ok: false,
+          unavailableReason: `grok token endpoint returned ${response.status}`,
+          unavailableKind: httpFailureKind(response.status),
+        };
       }
 
       let json: unknown;

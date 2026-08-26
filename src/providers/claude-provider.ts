@@ -10,7 +10,7 @@ import {
   type UsageUnavailableKind,
   type UsageWindow,
 } from "../types.js";
-import { isRecord } from "../lib/values.js";
+import { isRecord, percentInRange } from "../lib/values.js";
 
 /** Anthropic OAuth usage endpoint (the same source `ccstatusline` reads). */
 const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
@@ -322,11 +322,18 @@ function describeFailure(error: unknown): UsageFailure {
   return { reason: "usage request failed" };
 }
 
+/**
+ * A bucket is only usable when its utilization is a real percentage.
+ *
+ * Bounds matter here more than they look: an out-of-range value such as -1 would
+ * otherwise be cached as a valid reading, and a negative utilization reads as
+ * abundant capacity to the budget rail that decides whether to dispatch work.
+ * An unparseable response has to fail closed, not look empty.
+ */
 function isUsageBucket(value: unknown): value is UsageBucket {
   return (
     isRecord(value) &&
-    typeof value.utilization === "number" &&
-    Number.isFinite(value.utilization) &&
+    percentInRange(value.utilization) !== undefined &&
     (typeof value.resets_at === "string" || value.resets_at === null)
   );
 }
