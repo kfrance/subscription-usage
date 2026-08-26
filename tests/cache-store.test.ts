@@ -614,6 +614,43 @@ describe("CachingUsageProvider request collapsing", () => {
 });
 
 describe("invalidateCachedReading", () => {
+  it("keeps an invalidated reading unservable when a racing writer restores it", async () => {
+    // The race this guards: a process holds the lock, reads the entry, and is
+    // waiting on the vendor. `record` invalidates the reading because a dispatch
+    // happened that could not be measured. The holder then takes a 429 and
+    // writes its pre-invalidation entry back, restoring a reading known to
+    // understate usage. Deleting the snapshot alone cannot survive that; the
+    // cutoff can.
+    const disk = fakeDisk(cachedReading(T0 - 5 * MINUTE, 42));
+    const staleEntry = disk.files.get(CLAUDE_PATH);
+
+    invalidateCachedReading(CACHE_DIR, "claude", {
+      capturedBefore: T0,
+      readFile: (path) => disk.readFile(path),
+      writeFileAtomic: (path, data) => disk.writeFileAtomic(path, data),
+      removeFile: (path) => void disk.files.delete(path),
+    });
+
+    // The racing holder writes its pre-invalidation view back, snapshot and all.
+    const restored = JSON.parse(staleEntry as string) as Record<string, unknown>;
+    const afterInvalidation = JSON.parse(disk.files.get(CLAUDE_PATH) as string) as Record<string, unknown>;
+    disk.writeFileAtomic(
+      CLAUDE_PATH,
+      `${JSON.stringify({ ...restored, invalidBefore: afterInvalidation.invalidBefore })}\n`,
+    );
+
+    const inner = fakeInner([unavailableSnapshot("claude", "offline")]);
+    const provider = makeProvider(inner, disk, {
+      freshMs: 2 * MINUTE,
+      staleCeilingMs: 6 * 60 * MINUTE,
+    });
+
+    const snapshot = await provider.getUsage();
+
+    expect(snapshot.unavailableReason).toContain("offline");
+    expect(snapshot.windows).toEqual([]);
+  });
+
   it("drops the reading but keeps the backoff", () => {
     const disk = fakeDisk(
       cacheFile({

@@ -63,6 +63,19 @@ interface CacheEntry {
   snapshot?: UsageSnapshot;
   blockedUntil?: number;
   consecutiveFailures?: number;
+  /**
+   * Readings captured before this instant are known to be untrustworthy and are
+   * never served, whatever the file happens to hold.
+   *
+   * Invalidation records this rather than only deleting the snapshot, because a
+   * deletion is an absence and an absence can be undone. A process holding the
+   * service lock reads the entry before its request and writes it back on a rate
+   * limit, so a snapshot dropped in between would reappear — and the reading
+   * invalidation drops is specifically one known to understate usage, which is
+   * the reading that must never come back. A cutoff survives that write; the
+   * snapshot beside it can reappear and stays unservable.
+   */
+  invalidBefore?: number;
 }
 
 /**
@@ -317,7 +330,8 @@ export class CachingUsageProvider implements UsageProvider {
     } catch {
       return undefined;
     }
-    return toCacheEntry(parsed);
+    const entry = toCacheEntry(parsed);
+    return entry === undefined ? undefined : withoutInvalidated(entry);
   }
 
   /** A success replaces the entry outright, which also clears the backoff. */
@@ -332,12 +346,16 @@ export class CachingUsageProvider implements UsageProvider {
    * already read under the lock, so this never re-reads the file.
    */
   private recordRateLimit(snapshot: UsageSnapshot, previous: CacheEntry | undefined): void {
-    const failures = (previous?.consecutiveFailures ?? 0) + 1;
+    // Re-read rather than trusting the entry from before the request: an
+    // invalidation may have landed while it was in flight, and writing the older
+    // entry back would restore the reading it dropped.
+    const current = this.readEntry() ?? previous;
+    const failures = (current?.consecutiveFailures ?? 0) + 1;
     const backoffMs = Math.min(BASE_BACKOFF_MS * 2 ** (failures - 1), MAX_BACKOFF_MS);
     // Honor a server-provided deadline only when it asks us to wait longer than
     // our own floor; this endpoint's `retry-after: 0` must not shorten it.
     const blockedUntil = Math.max(this.now() + backoffMs, snapshot.retryAfter ?? 0);
-    this.writeEntry({ ...previous, blockedUntil, consecutiveFailures: failures });
+    this.writeEntry({ ...current, blockedUntil, consecutiveFailures: failures });
   }
 
   /**
@@ -457,10 +475,25 @@ function toCacheEntry(parsed: unknown): CacheEntry | undefined {
   if (typeof parsed.consecutiveFailures === "number" && Number.isFinite(parsed.consecutiveFailures)) {
     entry.consecutiveFailures = parsed.consecutiveFailures;
   }
+  if (typeof parsed.invalidBefore === "number" && Number.isFinite(parsed.invalidBefore)) {
+    entry.invalidBefore = parsed.invalidBefore;
+  }
   if (isCachedSnapshot(parsed.snapshot)) {
     entry.snapshot = parsed.snapshot;
   }
   return entry;
+}
+
+/**
+ * Drop a stored reading the cutoff has superseded, so no path downstream can
+ * serve it, treat it as a baseline, or write it back.
+ */
+function withoutInvalidated(entry: CacheEntry): CacheEntry {
+  const capturedAt = entry.snapshot?.capturedAt;
+  if (entry.invalidBefore === undefined || capturedAt === undefined) {
+    return entry;
+  }
+  return capturedAt < entry.invalidBefore ? { ...entry, snapshot: undefined } : entry;
 }
 
 /** A stored snapshot must carry the fields the freshness test reads. */
@@ -503,11 +536,16 @@ export interface InvalidateOptions
  * eligibility rail already applies to an unreadable service. The backoff is kept
  * so that invalidating does not turn into an immediate retry storm.
  *
- * The `capturedBefore` cutoff is what makes this safe to run without holding the
- * service lock. A concurrent fetch that succeeds writes a reading captured after
- * the cutoff, which this leaves alone; one that fails leaves the old reading,
- * which this correctly drops. Only a write landing inside the read-then-write
- * window here can still be lost, and that costs one extra live request.
+ * Recording the cutoff is what makes this safe without holding the service lock.
+ * A process that holds it read the entry before its request and writes that
+ * entry back on a rate limit, so deleting the snapshot alone would let the
+ * dropped reading reappear — and this reading in particular is one known to
+ * understate usage, so its return would authorize work against capacity already
+ * spent. The cutoff is stored beside the snapshot and survives that write-back,
+ * which leaves the resurrected reading present but permanently unservable.
+ *
+ * A concurrent fetch that succeeds writes a reading captured after the cutoff,
+ * which is served normally.
  */
 export function invalidateCachedReading(
   cacheDir: string,
@@ -525,14 +563,18 @@ export function invalidateCachedReading(
   } catch {
     return; // No file, or an unreadable one: already a cache miss.
   }
-  if (entry?.snapshot === undefined) {
-    return; // Nothing servable is stored, so nothing to drop.
+  if (entry === undefined) {
+    return; // No usable file, so nothing to drop and nothing to write back to.
   }
-  const { capturedAt } = entry.snapshot;
+  const capturedAt = entry.snapshot?.capturedAt;
   if (capturedAt !== undefined && capturedAt >= options.capturedBefore) {
     return; // Someone recorded a trustworthy reading; keep it.
   }
+  if (entry.snapshot === undefined && entry.invalidBefore !== undefined
+    && entry.invalidBefore >= options.capturedBefore) {
+    return; // Already invalidated at least this far forward.
+  }
 
   const { snapshot: _dropped, version: _version, ...kept } = entry;
-  writeCacheEntry(path, kept, write, remove);
+  writeCacheEntry(path, { ...kept, invalidBefore: options.capturedBefore }, write, remove);
 }
