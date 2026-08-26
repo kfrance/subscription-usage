@@ -269,6 +269,44 @@ describe("CachingUsageProvider stale readings", () => {
     expect((await provider.getUsage()).unavailableReason).toContain("429");
   });
 
+  it("keeps serving the stored reading for the whole rate-limit backoff", async () => {
+    // The call that armed the backoff returned the stale reading; every call
+    // during the backoff must too, or a stale-tolerant panel blanks out for the
+    // backoff's duration and then comes back, which is worse than either state.
+    const inner = fakeInner([]);
+    const disk = fakeDisk(cacheFile({
+      snapshot: { ...goodSnapshot(42), capturedAt: T0 - 5 * MINUTE },
+      blockedUntil: T0 + 2 * MINUTE,
+      consecutiveFailures: 1,
+    }));
+    const provider = makeProvider(inner, disk, {
+      freshMs: 2 * MINUTE,
+      staleCeilingMs: 6 * 60 * MINUTE,
+    });
+
+    const snapshot = await provider.getUsage();
+
+    expect(inner.calls).toBe(0);
+    expect(snapshot.unavailableReason).toBeUndefined();
+    expect(snapshot.windows[0]?.usedPercent).toBe(42);
+    expect(snapshot.refreshError).toContain("rate limited");
+  });
+
+  it("still reports unavailable during a backoff for a caller that gates spending", async () => {
+    const inner = fakeInner([]);
+    const disk = fakeDisk(cacheFile({
+      snapshot: { ...goodSnapshot(42), capturedAt: T0 - 5 * MINUTE },
+      blockedUntil: T0 + 2 * MINUTE,
+    }));
+    const provider = makeProvider(inner, disk, { freshMs: 2 * MINUTE });
+
+    const snapshot = await provider.getUsage();
+
+    expect(inner.calls).toBe(0);
+    expect(snapshot.unavailableReason).toContain("rate limited");
+    expect(snapshot.windows).toEqual([]);
+  });
+
   it("still refuses a stale reading whose window has already reset", async () => {
     // A reset only lowers utilization, so a reading taken before one overstates
     // spend. Serving it as stale would be worse than saying nothing.

@@ -183,14 +183,22 @@ export class CachingUsageProvider implements UsageProvider {
     // policy that always refreshes is what LearnWhale's `record` wants: it diffs
     // a before reading against an after reading, so it needs a live one.
     const stored = entry?.snapshot;
-    if (this.freshness(stored, now).use === "cached" && isServable(stored, now)) {
+    const decision = this.freshness(stored, now);
+    if (decision.use === "cached" && isServable(stored, now)) {
       return stored;
     }
 
     // A live rate limit is still in force; asking again only deepens it.
     if (entry?.blockedUntil !== undefined && entry.blockedUntil > now) {
       const waitSeconds = Math.ceil((entry.blockedUntil - now) / 1000);
-      return unavailableSnapshot(this.service, `rate limited; not retrying for ${waitSeconds}s`, "rate-limited");
+      const reason = `rate limited; not retrying for ${waitSeconds}s`;
+      // The backoff says do not ask again; it does not say forget what we know.
+      // A caller that accepts stale readings should keep seeing the stored one
+      // for the whole backoff, not just on the call that armed it.
+      if (decision.use === "refresh" && decision.staleOk && isServable(stored, now)) {
+        return { ...stored, refreshError: reason };
+      }
+      return unavailableSnapshot(this.service, reason, "rate-limited");
     }
 
     // Another process is already fetching this service. Joining it would be the
@@ -211,8 +219,8 @@ export class CachingUsageProvider implements UsageProvider {
       const lockedNow = this.now();
       const current = this.readEntry();
       const currentSnapshot = current?.snapshot;
-      const decision = this.freshness(currentSnapshot, lockedNow);
-      if (decision.use === "cached" && isServable(currentSnapshot, lockedNow)) {
+      const lockedDecision = this.freshness(currentSnapshot, lockedNow);
+      if (lockedDecision.use === "cached" && isServable(currentSnapshot, lockedNow)) {
         return currentSnapshot;
       }
 
@@ -234,7 +242,8 @@ export class CachingUsageProvider implements UsageProvider {
         // tagged with what went wrong, so a panel can show figures and say they
         // are not current. Callers that gate spending do not set `staleOk`, so
         // they still see the failure.
-        if (decision.use === "refresh" && decision.staleOk && isServable(currentSnapshot, lockedNow)) {
+        if (lockedDecision.use === "refresh" && lockedDecision.staleOk
+          && isServable(currentSnapshot, lockedNow)) {
           return { ...currentSnapshot, refreshError: snapshot.unavailableReason };
         }
         return snapshot;

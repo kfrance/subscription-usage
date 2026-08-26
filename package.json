@@ -15,7 +15,8 @@
     "lint:fix": "eslint . --fix",
     "check": "tsc --noEmit",
     "test": "vitest run --configLoader runner",
-    "test:watch": "vitest --configLoader runner"
+    "test:watch": "vitest --configLoader runner",
+    "test:live": "SUBSCRIPTION_USAGE_LIVE_TESTS=1 vitest run --configLoader runner tests/providers/cursor-provider.live.test.ts"
   },
   "dependencies": {
     "smol-toml": "^1.3.1"

@@ -29,7 +29,7 @@ prefers a stale panel to an empty one.
 | `make lint` | Run ESLint across the package |
 | `make check` | Type-check with `tsc --noEmit` |
 | `make test` | Run lint, then the type check, then the test suite |
-| `npx vitest run tests/providers/cursor-provider.live.test.ts` | Check a vendor's live payload against the provider |
+| `npm run test:live` | Check a vendor's live payload against the provider |
 
 Live tests call real vendor APIs with real credentials, so `make test` excludes
 them. Run one when a provider starts failing in a way the fixtures do not
