@@ -56,7 +56,8 @@ The subscription inventory is read from
 `LEARNWHALE_AUTOMATION_META_LOOP_SUBSCRIPTIONS_PATH`.
 
 Cached readings live in
-`${XDG_STATE_HOME:-~/.local/state}/learnwhale/ai-usage/`, one file per service,
+`${XDG_STATE_HOME:-~/.local/state}/learnwhale/ai-usage/`, one file per service
+plus a small `<service>.invalid.json` recording when a reading was ruled out,
 overridable with `AI_USAGE_CACHE_DIR`. That directory is deliberately outside
 either application's checkout so both processes find the same readings, and it
 sits under `learnwhale/` because that is the path LearnWhale's unattended

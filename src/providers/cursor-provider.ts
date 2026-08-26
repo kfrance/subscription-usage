@@ -75,9 +75,16 @@ export class CursorUsageProvider implements UsageProvider {
     }
 
     try {
-      const [usageResponse, planResponse] = await Promise.all([
+      // The plan request is optional all the way down, including its rejection.
+      // Leaving it in a bare Promise.all meant a network error or timeout there
+      // rejected the pair and discarded a usage response that was independently
+      // sufficient, which is the opposite of treating it as optional.
+      const [usageResponse, planSettled] = await Promise.all([
         this.call("GetCurrentPeriodUsage", accessToken),
-        this.call("GetPlanInfo", accessToken),
+        this.call("GetPlanInfo", accessToken).then(
+          (response) => response,
+          () => undefined,
+        ),
       ]);
       if (!usageResponse.ok) {
         return unavailableSnapshot(
@@ -93,8 +100,8 @@ export class CursorUsageProvider implements UsageProvider {
       // here as fatal discarded complete, usable percentages over missing
       // metadata. If the usage payload also lacks a reset, normalization reports
       // the snapshot unavailable on its own.
-      const plan = planResponse.ok
-        ? await readJson<CursorPlanPayload>(planResponse, "plan").catch(() => ({}))
+      const plan = planSettled?.ok
+        ? await readJson<CursorPlanPayload>(planSettled, "plan").catch(() => ({}))
         : {};
       return normalizeCursorUsage(usage, plan);
     } catch (error) {

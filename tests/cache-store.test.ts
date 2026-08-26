@@ -631,13 +631,10 @@ describe("invalidateCachedReading", () => {
       removeFile: (path) => void disk.files.delete(path),
     });
 
-    // The racing holder writes its pre-invalidation view back, snapshot and all.
-    const restored = JSON.parse(staleEntry as string) as Record<string, unknown>;
-    const afterInvalidation = JSON.parse(disk.files.get(CLAUDE_PATH) as string) as Record<string, unknown>;
-    disk.writeFileAtomic(
-      CLAUDE_PATH,
-      `${JSON.stringify({ ...restored, invalidBefore: afterInvalidation.invalidBefore })}\n`,
-    );
+    // The racing holder writes its pre-invalidation view back verbatim, snapshot
+    // and all — it never saw the cutoff, and it does not write the file holding
+    // one, which is the whole point.
+    disk.writeFileAtomic(CLAUDE_PATH, staleEntry as string);
 
     const inner = fakeInner([unavailableSnapshot("claude", "offline")]);
     const provider = makeProvider(inner, disk, {

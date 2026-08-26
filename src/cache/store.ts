@@ -63,19 +63,6 @@ interface CacheEntry {
   snapshot?: UsageSnapshot;
   blockedUntil?: number;
   consecutiveFailures?: number;
-  /**
-   * Readings captured before this instant are known to be untrustworthy and are
-   * never served, whatever the file happens to hold.
-   *
-   * Invalidation records this rather than only deleting the snapshot, because a
-   * deletion is an absence and an absence can be undone. A process holding the
-   * service lock reads the entry before its request and writes it back on a rate
-   * limit, so a snapshot dropped in between would reappear — and the reading
-   * invalidation drops is specifically one known to understate usage, which is
-   * the reading that must never come back. A cutoff survives that write; the
-   * snapshot beside it can reappear and stays unservable.
-   */
-  invalidBefore?: number;
 }
 
 /**
@@ -313,6 +300,10 @@ export class CachingUsageProvider implements UsageProvider {
     return join(this.cacheDir, `${this.service}.lock`);
   }
 
+  private invalidPath(): string {
+    return invalidPath(this.cacheDir, this.service);
+  }
+
   private entryPath(): string {
     return join(this.cacheDir, `${this.service}.json`);
   }
@@ -331,7 +322,10 @@ export class CachingUsageProvider implements UsageProvider {
       return undefined;
     }
     const entry = toCacheEntry(parsed);
-    return entry === undefined ? undefined : withoutInvalidated(entry);
+    if (entry === undefined) {
+      return undefined;
+    }
+    return withoutInvalidated(entry, readInvalidBefore(this.invalidPath(), this.readFile));
   }
 
   /** A success replaces the entry outright, which also clears the backoff. */
@@ -346,9 +340,10 @@ export class CachingUsageProvider implements UsageProvider {
    * already read under the lock, so this never re-reads the file.
    */
   private recordRateLimit(snapshot: UsageSnapshot, previous: CacheEntry | undefined): void {
-    // Re-read rather than trusting the entry from before the request: an
-    // invalidation may have landed while it was in flight, and writing the older
-    // entry back would restore the reading it dropped.
+    // Re-read rather than trusting the entry from before the request, so a
+    // reading another process recorded meanwhile is not overwritten. Restoring a
+    // snapshot this way is harmless now: the cutoff lives in its own file, so a
+    // reading an invalidation disqualified stays unservable however it returns.
     const current = this.readEntry() ?? previous;
     const failures = (current?.consecutiveFailures ?? 0) + 1;
     const backoffMs = Math.min(BASE_BACKOFF_MS * 2 ** (failures - 1), MAX_BACKOFF_MS);
@@ -475,9 +470,6 @@ function toCacheEntry(parsed: unknown): CacheEntry | undefined {
   if (typeof parsed.consecutiveFailures === "number" && Number.isFinite(parsed.consecutiveFailures)) {
     entry.consecutiveFailures = parsed.consecutiveFailures;
   }
-  if (typeof parsed.invalidBefore === "number" && Number.isFinite(parsed.invalidBefore)) {
-    entry.invalidBefore = parsed.invalidBefore;
-  }
   if (isCachedSnapshot(parsed.snapshot)) {
     entry.snapshot = parsed.snapshot;
   }
@@ -485,15 +477,44 @@ function toCacheEntry(parsed: unknown): CacheEntry | undefined {
 }
 
 /**
- * Drop a stored reading the cutoff has superseded, so no path downstream can
- * serve it, treat it as a baseline, or write it back.
+ * Drop a stored reading that the cutoff has superseded, so no path downstream
+ * can serve it, treat it as a baseline, or write it back.
  */
-function withoutInvalidated(entry: CacheEntry): CacheEntry {
+function withoutInvalidated(entry: CacheEntry, invalidBefore: number | undefined): CacheEntry {
   const capturedAt = entry.snapshot?.capturedAt;
-  if (entry.invalidBefore === undefined || capturedAt === undefined) {
+  if (invalidBefore === undefined || capturedAt === undefined) {
     return entry;
   }
-  return capturedAt < entry.invalidBefore ? { ...entry, snapshot: undefined } : entry;
+  return capturedAt < invalidBefore ? { ...entry, snapshot: undefined } : entry;
+}
+
+/**
+ * Read a service's invalidation cutoff, or undefined when there is none.
+ *
+ * The cutoff lives in its own file rather than beside the reading, because the
+ * whole point is that it survives a writer who is holding a view of the entry
+ * from before the invalidation. That writer rewrites the entry file wholesale;
+ * it never touches this one, so no interleaving of entry reads and writes can
+ * carry the cutoff away with the snapshot it disqualifies.
+ */
+function readInvalidBefore(path: string, readFile: (path: string) => string): number | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFile(path));
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(parsed) || parsed.version !== CACHE_VERSION) {
+    return undefined;
+  }
+  return typeof parsed.invalidBefore === "number" && Number.isFinite(parsed.invalidBefore)
+    ? parsed.invalidBefore
+    : undefined;
+}
+
+/** Path of the sidecar holding a service's invalidation cutoff. */
+function invalidPath(cacheDir: string, service: UsageService): string {
+  return join(cacheDir, `${service}.invalid.json`);
 }
 
 /** A stored snapshot must carry the fields the freshness test reads. */
@@ -557,24 +578,46 @@ export function invalidateCachedReading(
   const remove = options.removeFile ?? defaultRemoveFile;
   const path = join(cacheDir, `${service}.json`);
 
+  const sidecar = invalidPath(cacheDir, service);
+  const already = readInvalidBefore(sidecar, readFile);
+  if (already !== undefined && already >= options.capturedBefore) {
+    return; // Already invalidated at least this far forward.
+  }
+
   let entry: CacheEntry | undefined;
   try {
     entry = toCacheEntry(JSON.parse(readFile(path)));
   } catch {
-    return; // No file, or an unreadable one: already a cache miss.
+    entry = undefined; // No file yet, or an unreadable one.
   }
-  if (entry === undefined) {
-    return; // No usable file, so nothing to drop and nothing to write back to.
-  }
-  const capturedAt = entry.snapshot?.capturedAt;
+  const capturedAt = entry?.snapshot?.capturedAt;
   if (capturedAt !== undefined && capturedAt >= options.capturedBefore) {
     return; // Someone recorded a trustworthy reading; keep it.
   }
-  if (entry.snapshot === undefined && entry.invalidBefore !== undefined
-    && entry.invalidBefore >= options.capturedBefore) {
-    return; // Already invalidated at least this far forward.
+
+  // The cutoff first: it is what actually disqualifies the reading, and it has
+  // to be in place before the deletion in case this process stops here.
+  try {
+    write(
+      sidecar,
+      `${JSON.stringify({ version: CACHE_VERSION, invalidBefore: options.capturedBefore }, null, 2)}\n`,
+      CACHE_FILE_MODE,
+    );
+  } catch {
+    // The cutoff is what makes a deletion durable, so without it fall back to
+    // removing the reading outright. That degrades to a cache miss, which is the
+    // fail-closed outcome; leaving a reading known to understate usage in place
+    // is the one result that must not happen.
+    try {
+      remove(path);
+    } catch {
+      // Nothing further to try.
+    }
+    return;
   }
 
-  const { snapshot: _dropped, version: _version, ...kept } = entry;
-  writeCacheEntry(path, { ...kept, invalidBefore: options.capturedBefore }, write, remove);
+  if (entry?.snapshot !== undefined) {
+    const { snapshot: _dropped, version: _version, ...kept } = entry;
+    writeCacheEntry(path, kept, write, remove);
+  }
 }

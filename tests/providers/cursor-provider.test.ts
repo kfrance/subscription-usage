@@ -68,4 +68,32 @@ describe("CursorUsageProvider", () => {
     expect(snapshot.planType).toBe("");
     expect(snapshot.windows.find((window) => window.label === "monthly")?.usedPercent).toBe(37);
   });
+
+  it("keeps usable usage when the optional plan request rejects outright", async () => {
+    // Not just an error status: a network failure or timeout rejects the promise,
+    // and pairing it with the usage request meant that rejection discarded a
+    // usage response that was independently sufficient.
+    const resetsAt = Date.now() + 7 * 24 * 60 * 60 * 1000;
+    const provider = new CursorUsageProvider({
+      authPath: "/auth.json",
+      readFile: () => JSON.stringify({ accessToken: "token" }),
+      fetchImpl: (async (url: string) => {
+        if (String(url).includes("GetPlanInfo")) {
+          throw new Error("ECONNRESET");
+        }
+        return new Response(
+          JSON.stringify({
+            billingCycleEnd: String(resetsAt),
+            planUsage: { totalPercentUsed: 37 },
+          }),
+          { status: 200 },
+        );
+      }) as unknown as typeof fetch,
+    });
+
+    const snapshot = await provider.getUsage();
+
+    expect(snapshot.unavailableReason).toBeUndefined();
+    expect(snapshot.windows.find((window) => window.label === "monthly")?.usedPercent).toBe(37);
+  });
 });
