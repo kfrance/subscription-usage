@@ -10,3 +10,18 @@ export { ClaudeUsageProvider, type ClaudeUsageProviderOptions } from "./claude-p
 export { CodexUsageProvider, type CodexUsageProviderOptions } from "./codex-provider.js";
 export { CursorUsageProvider, normalizeCursorUsage, type CursorUsageProviderOptions } from "./cursor-provider.js";
 export { GrokUsageProvider, type GrokUsageProviderOptions } from "./grok-provider.js";
+
+/**
+ * Codex's rate-limit probe. Exported beside the providers because the
+ * test-effectiveness loop reads these windows directly to size a batch, rather
+ * than through a `UsageSnapshot`.
+ */
+export {
+  buildCodexInitializeRequest,
+  getCodexRateLimits,
+  parseRateLimitSnapshot,
+  type CodexRateLimitOptions,
+  type CodexRateLimitResult,
+  type CodexRateLimitSnapshot,
+  type CodexRateLimitWindowSnapshot,
+} from "./codex-rate-limit.js";
