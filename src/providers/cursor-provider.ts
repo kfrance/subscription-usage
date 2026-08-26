@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { httpFailureKind, unavailableSnapshot, type UsageProvider, type UsageSnapshot, type UsageWindow } from "../types.js";
+import { describeError, percentInRange } from "../lib/values.js";
 
 const DEFAULT_API_BASE = "https://api2.cursor.sh";
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -132,15 +133,15 @@ export function normalizeCursorUsage(
 ): UsageSnapshot {
   const reset = epochMillis(usage.billingCycleEnd) ?? epochMillis(plan.planInfo?.billingCycleEnd);
   const start = epochMillis(usage.billingCycleStart);
-  const total = percentage(usage.planUsage?.totalPercentUsed);
+  const total = percentInRange(usage.planUsage?.totalPercentUsed);
   if (reset === undefined || total === undefined) {
     return unavailableSnapshot("cursor", "Cursor usage response malformed");
   }
 
   const cycle = { resetsAt: reset, ...(start === undefined ? {} : { startsAt: start }) };
   const windows: UsageWindow[] = [{ label: "monthly", usedPercent: total, ...cycle }];
-  const auto = percentage(usage.planUsage?.autoPercentUsed);
-  const api = percentage(usage.planUsage?.apiPercentUsed);
+  const auto = percentInRange(usage.planUsage?.autoPercentUsed);
+  const api = percentInRange(usage.planUsage?.apiPercentUsed);
   const cursorModels = stringArray(usage.autoBucketModels);
   if (auto !== undefined) {
     windows.push({
@@ -169,12 +170,6 @@ async function readJson<T>(response: Response, label: string): Promise<T> {
   }
 }
 
-function percentage(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 100
-    ? value
-    : undefined;
-}
-
 function stringArray(value: unknown): string[] | undefined {
   if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || !entry.trim())) {
     return undefined;
@@ -187,6 +182,3 @@ function epochMillis(value: unknown): number | undefined {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
 }
 
-function describeError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}

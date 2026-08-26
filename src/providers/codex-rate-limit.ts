@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { isRecord } from "../lib/values.js";
 
 export interface CodexRateLimitWindowSnapshot {
   label: "5h" | "weekly";
@@ -251,10 +252,6 @@ function hasResponseId(stdout: string, id: number): boolean {
 
 function firstLine(value: string): string | undefined {
   return value.split("\n").find((line) => line.trim())?.trim();
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function isPercent(value: unknown): value is number {

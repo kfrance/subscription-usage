@@ -9,6 +9,7 @@ import {
   type UsageProvider,
   type UsageSnapshot,
 } from "../types.js";
+import { describeError, isRecord, percentInRange } from "../lib/values.js";
 
 /**
  * Grok exposes usage through two cooperating surfaces:
@@ -333,11 +334,11 @@ function normalizeBilling(json: unknown, observedAt: number): UsageSnapshot {
   // The top-level percentage is the aggregate across Grok Build, Chat, Imagine,
   // and any future product buckets. Use GrokBuild only as a compatibility
   // fallback for older payloads that do not expose the aggregate.
-  let usedPercent = readPercent(config.creditUsagePercent);
+  let usedPercent = percentInRange(config.creditUsagePercent);
   if (usedPercent === undefined && Array.isArray(config.productUsage)) {
     for (const product of config.productUsage) {
       if (isRecord(product) && product.product === "GrokBuild") {
-        const productPercent = readPercent(product.usagePercent);
+        const productPercent = percentInRange(product.usagePercent);
         if (productPercent !== undefined) {
           usedPercent = productPercent;
         }
@@ -394,12 +395,6 @@ function readPlanType(source: Record<string, unknown>): string | undefined {
   return typeof source.subscription_tier === "string" ? source.subscription_tier : undefined;
 }
 
-function readPercent(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 100
-    ? value
-    : undefined;
-}
-
 function readCreditValue(value: unknown): number | undefined {
   if (!isRecord(value)) {
     return undefined;
@@ -444,11 +439,3 @@ function isoFromEpochMs(epochMs: number): string {
   return new Date(epochMs).toISOString();
 }
 
-/** Default atomic writer: temp file in the same dir, then `rename` at mode 0600. */
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function describeError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}

@@ -10,6 +10,7 @@ import {
   type UsageUnavailableKind,
   type UsageWindow,
 } from "../types.js";
+import { isRecord } from "../lib/values.js";
 
 /** Anthropic OAuth usage endpoint (the same source `ccstatusline` reads). */
 const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
@@ -319,10 +320,6 @@ function describeFailure(error: unknown): UsageFailure {
       : { reason: error.message };
   }
   return { reason: "usage request failed" };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function isUsageBucket(value: unknown): value is UsageBucket {

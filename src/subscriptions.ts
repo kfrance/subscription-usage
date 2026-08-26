@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { parse } from "smol-toml";
 import type { UsageService } from "./types.js";
+import { describeError, isRecord } from "./lib/values.js";
 
 /** Vendor family a worker's model belongs to. */
 export type ModelFamily = "openai" | "anthropic" | "xai" | "cursor";
@@ -31,9 +32,9 @@ export interface SubscriptionEntry {
 export interface SubscriptionWorker {
   harness: string;
   model: string;
-  family?: ModelFamily;
+  family: ModelFamily;
   /** Usage pool that gates this worker; Cursor-hosted vendor models still draw Cursor. */
-  usageService?: UsageService;
+  usageService: UsageService;
   subscription: string;
 }
 
@@ -64,14 +65,14 @@ export function loadSubscriptionsInventory(
   try {
     raw = readFile(path);
   } catch (error) {
-    throw new Error(`Cannot read subscriptions manifest at ${path}: ${messageOf(error)}`);
+    throw new Error(`Cannot read subscriptions manifest at ${path}: ${describeError(error)}`);
   }
 
   let parsed: unknown;
   try {
     parsed = parse(raw);
   } catch (error) {
-    throw new Error(`subscriptions manifest at ${path} is not valid TOML: ${messageOf(error)}`);
+    throw new Error(`subscriptions manifest at ${path} is not valid TOML: ${describeError(error)}`);
   }
   if (!isRecord(parsed)) {
     throw new Error(`subscriptions manifest at ${path} must be a TOML table.`);
@@ -227,14 +228,6 @@ function findDuplicates(values: string[]): string[] {
   return [...duplicates];
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
 /**
  * Usage services worth querying, derived from the inventory.
  *
@@ -246,7 +239,7 @@ function messageOf(error: unknown): string {
 export function enabledUsageServices(inventory: SubscriptionsInventory): Set<UsageService> {
   const services = new Set<UsageService>();
   for (const worker of inventory.workers) {
-    if (worker.usageService) services.add(worker.usageService);
+    services.add(worker.usageService);
   }
   return services;
 }

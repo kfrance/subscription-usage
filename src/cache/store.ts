@@ -9,6 +9,7 @@ import {
   type UsageSnapshot,
   type UsageService,
 } from "../types.js";
+import { describeError, isRecord } from "../lib/values.js";
 
 /**
  * A caching decorator for any `UsageProvider`, and the single place the freshness
@@ -147,6 +148,9 @@ export interface CachingUsageProviderOptions {
   acquireLock?: (lockPath: string, label: string) => LockHandle;
 }
 
+const defaultReadFile = (path: string): string => readFileSync(path, "utf8");
+const defaultRemoveFile = (path: string): void => rmSync(path, { force: true });
+
 export class CachingUsageProvider implements UsageProvider {
   readonly service: UsageService;
 
@@ -165,9 +169,9 @@ export class CachingUsageProvider implements UsageProvider {
     this.cacheDir = options.cacheDir;
     this.freshness = options.freshness;
     this.now = options.now ?? Date.now;
-    this.readFile = options.readFile ?? ((path: string) => readFileSync(path, "utf8"));
+    this.readFile = options.readFile ?? defaultReadFile;
     this.writeFileAtomic = options.writeFileAtomic ?? writeFileAtomic;
-    this.removeFile = options.removeFile ?? ((path: string) => rmSync(path, { force: true }));
+    this.removeFile = options.removeFile ?? defaultRemoveFile;
     this.acquireLock = options.acquireLock ?? acquireFileLock;
   }
 
@@ -178,10 +182,9 @@ export class CachingUsageProvider implements UsageProvider {
     // Recent enough to reuse outright, as judged by the caller's policy. A
     // policy that always refreshes is what LearnWhale's `record` wants: it diffs
     // a before reading against an after reading, so it needs a live one.
-    let decision = this.freshness(entry?.snapshot, now);
-    const cached = servableSnapshot(entry, now, decision);
-    if (cached) {
-      return cached;
+    const stored = entry?.snapshot;
+    if (this.freshness(stored, now).use === "cached" && isServable(stored, now)) {
+      return stored;
     }
 
     // A live rate limit is still in force; asking again only deepens it.
@@ -203,11 +206,14 @@ export class CachingUsageProvider implements UsageProvider {
     try {
       // The lock holder may have just filled the cache while we waited on it, so
       // re-read rather than trusting the entry from before the lock.
+      // One clock sample for the whole locked section, so the policy and the
+      // servability check cannot disagree about what "now" is.
+      const lockedNow = this.now();
       const current = this.readEntry();
-      decision = this.freshness(current?.snapshot, this.now());
-      const refreshed = servableSnapshot(current, this.now(), decision);
-      if (refreshed) {
-        return refreshed;
+      const currentSnapshot = current?.snapshot;
+      const decision = this.freshness(currentSnapshot, lockedNow);
+      if (decision.use === "cached" && isServable(currentSnapshot, lockedNow)) {
+        return currentSnapshot;
       }
 
       let snapshot: UsageSnapshot;
@@ -228,9 +234,8 @@ export class CachingUsageProvider implements UsageProvider {
         // tagged with what went wrong, so a panel can show figures and say they
         // are not current. Callers that gate spending do not set `staleOk`, so
         // they still see the failure.
-        const stale = current?.snapshot;
-        if (decision.use === "refresh" && decision.staleOk && isServable(stale, this.now())) {
-          return { ...stale, refreshError: snapshot.unavailableReason };
+        if (decision.use === "refresh" && decision.staleOk && isServable(currentSnapshot, lockedNow)) {
+          return { ...currentSnapshot, refreshError: snapshot.unavailableReason };
         }
         return snapshot;
       }
@@ -324,18 +329,6 @@ function writeCacheEntry(
   }
 }
 
-/** The stored reading, when the policy says to serve it and it is still usable. */
-function servableSnapshot(
-  entry: CacheEntry | undefined,
-  now: number,
-  decision: FreshnessDecision,
-): UsageSnapshot | undefined {
-  if (decision.use !== "cached") {
-    return undefined;
-  }
-  return isServable(entry?.snapshot, now) ? entry?.snapshot : undefined;
-}
-
 /**
  * A stored reading is usable at all: it is a real reading rather than a recorded
  * failure, it knows when it was taken, and none of its windows has reset since.
@@ -412,14 +405,6 @@ function isCachedSnapshot(value: unknown): value is UsageSnapshot {
   );
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function describeError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
 export interface InvalidateOptions
   extends Pick<CachingUsageProviderOptions, "readFile" | "writeFileAtomic" | "removeFile"> {
   /**
@@ -455,9 +440,9 @@ export function invalidateCachedReading(
   service: UsageService,
   options: InvalidateOptions,
 ): void {
-  const readFile = options.readFile ?? ((path: string) => readFileSync(path, "utf8"));
+  const readFile = options.readFile ?? defaultReadFile;
   const write = options.writeFileAtomic ?? writeFileAtomic;
-  const remove = options.removeFile ?? ((path: string) => rmSync(path, { force: true }));
+  const remove = options.removeFile ?? defaultRemoveFile;
   const path = join(cacheDir, `${service}.json`);
 
   let entry: CacheEntry | undefined;
