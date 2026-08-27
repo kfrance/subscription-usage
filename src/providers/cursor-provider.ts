@@ -1,8 +1,8 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { httpFailureKind, unavailableSnapshot, type UsageProvider, type UsageSnapshot, type UsageWindow } from "../types.js";
-import { describeError, percentInRange } from "../lib/values.js";
+import { percentInRange, httpFailureKind, unavailableSnapshot, type UsageProvider, type UsageSnapshot, type UsageWindow } from "../types.js";
+import { describeError } from "../lib/values.js";
 
 const DEFAULT_API_BASE = "https://api2.cursor.sh";
 const DEFAULT_TIMEOUT_MS = 10_000;

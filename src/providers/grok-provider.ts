@@ -9,8 +9,9 @@ import {
   type UsageProvider,
   type UsageSnapshot,
   type UsageUnavailableKind,
+  percentInRange,
 } from "../types.js";
-import { describeError, isRecord, percentInRange } from "../lib/values.js";
+import { describeError, isRecord } from "../lib/values.js";
 
 /**
  * Grok exposes usage through two cooperating surfaces:

@@ -1,3 +1,27 @@
+import { unavailableSnapshot, type UsageProvider, type UsageSnapshot } from "../types.js";
+import { describeError } from "../lib/values.js";
+
+/**
+ * Read every provider, letting none of them abort the batch.
+ *
+ * Providers here answer with a snapshot rather than throwing, and this is the
+ * belt that makes that true for callers even if one ever does. It lives beside
+ * the providers because it enforces their contract: both consumers had written
+ * the same function, so a provider that started throwing something new would
+ * have been handled in one application and not the other.
+ */
+export async function fetchSnapshots(providers: UsageProvider[]): Promise<UsageSnapshot[]> {
+  return Promise.all(
+    providers.map(async (provider) => {
+      try {
+        return await provider.getUsage();
+      } catch (error) {
+        return unavailableSnapshot(provider.service, describeError(error));
+      }
+    }),
+  );
+}
+
 /**
  * One provider per vendor. Each reads that vendor's own on-disk credentials,
  * calls its usage endpoint, and returns a normalized `UsageSnapshot`.

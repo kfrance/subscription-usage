@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { isRecord } from "../lib/values.js";
+import { percentInRange } from "../types.js";
 
 /**
  * How this probe identifies itself to the Codex app server.
@@ -266,8 +267,16 @@ function firstLine(value: string): string | undefined {
   return value.split("\n").find((line) => line.trim())?.trim();
 }
 
+/**
+ * The shared 0-100 bound, narrowed to whole numbers.
+ *
+ * Codex reports integer percentages, and the parser uses that to reject a
+ * drifted payload — so this is a deliberate narrowing of the shared guard rather
+ * than a second copy of the range, which is why it defers to `percentInRange`
+ * for the bound itself.
+ */
 function isPercent(value: unknown): value is number {
-  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 100;
+  return percentInRange(value) !== undefined && Number.isInteger(value);
 }
 
 function isPositiveInteger(value: unknown): value is number {

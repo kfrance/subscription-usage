@@ -8,8 +8,10 @@ import {
   type UsageProvider,
   type UsageSnapshot,
   type UsageService,
+  percentInRange,
+  type UsageWindow,
 } from "../types.js";
-import { describeError, isRecord, percentInRange } from "../lib/values.js";
+import { describeError, finiteNumber, isRecord } from "../lib/values.js";
 
 /**
  * A caching decorator for any `UsageProvider`, and the single place the freshness
@@ -178,58 +180,39 @@ export class CachingUsageProvider implements UsageProvider {
   async getUsage(): Promise<UsageSnapshot> {
     const now = this.now();
     const entry = this.readEntry();
+    const stored = entry?.snapshot;
+    const decision = this.freshness(stored, now);
 
     // Recent enough to reuse outright, as judged by the caller's policy. A
     // policy that always refreshes is what LearnWhale's `record` wants: it diffs
     // a before reading against an after reading, so it needs a live one.
-    const stored = entry?.snapshot;
-    const decision = this.freshness(stored, now);
     if (decision.use === "cached" && isCurrent(stored, now)) {
       return stored;
     }
 
-    // A live rate limit is still in force; asking again only deepens it.
-    if (entry?.blockedUntil !== undefined && entry.blockedUntil > now) {
-      const waitSeconds = Math.ceil((entry.blockedUntil - now) / 1000);
-      const reason = `rate limited; not retrying for ${waitSeconds}s`;
-      // The backoff says do not ask again; it does not say forget what we know.
-      // A caller that accepts stale readings should keep seeing the stored one
-      // for the whole backoff, not just on the call that armed it.
-      const stale = decision.use === "refresh" && decision.staleOk
-        ? staleReading(stored, now)
-        : undefined;
-      if (stale) {
-        return { ...stale, refreshError: reason };
-      }
-      return unavailableSnapshot(this.service, reason, "rate-limited");
+    const blocked = this.whileBackedOff(entry, decision, stored, now);
+    if (blocked) {
+      return blocked;
     }
 
     // Another process is already fetching this service. Joining it would be the
     // very burst this cache exists to prevent, so do not pile on; the next call
-    // picks up the reading that process writes.
-    //
-    // Contention is normal here rather than exceptional, because two
-    // applications share this cache, so treat it as a failed refresh rather than
-    // as an erasure: a caller that accepts stale readings keeps its stored one.
+    // picks up the reading that process writes. Contention is routine rather
+    // than exceptional, because two applications share this cache, so it counts
+    // as a failed refresh rather than an erasure.
     let lock: LockHandle;
     try {
       lock = this.acquireLock(this.lockPath(), `${this.service} usage fetch`);
     } catch {
       const reason = "another process is reading usage";
-      const stale = decision.use === "refresh" && decision.staleOk
-        ? staleReading(stored, now)
-        : undefined;
-      if (stale) {
-        return { ...stale, refreshError: reason };
-      }
-      return unavailableSnapshot(this.service, reason);
+      return this.staleFallback(decision, stored, now, reason)
+        ?? unavailableSnapshot(this.service, reason);
     }
 
     try {
-      // The lock holder may have just filled the cache while we waited on it, so
-      // re-read rather than trusting the entry from before the lock.
       // One clock sample for the whole locked section, so the policy and the
-      // servability check cannot disagree about what "now" is.
+      // servability check cannot disagree about what "now" is. The entry is
+      // re-read because the process we waited on may have just filled it.
       const lockedNow = this.now();
       const current = this.readEntry();
       const currentSnapshot = current?.snapshot;
@@ -238,20 +221,18 @@ export class CachingUsageProvider implements UsageProvider {
         return currentSnapshot;
       }
 
-      // Another process may have taken a 429 and armed a backoff between the
-      // read above and this lock. Re-checking here is what makes the backoff
-      // shared: without it a caller that always refreshes would ask the vendor
-      // again immediately and deepen the limit the other process just hit.
-      if (current?.blockedUntil !== undefined && current.blockedUntil > lockedNow) {
-        const waitSeconds = Math.ceil((current.blockedUntil - lockedNow) / 1000);
-        const reason = `rate limited; not retrying for ${waitSeconds}s`;
-        const stale = lockedDecision.use === "refresh" && lockedDecision.staleOk
-          ? staleReading(currentSnapshot, lockedNow)
-          : undefined;
-        if (stale) {
-          return { ...stale, refreshError: reason };
-        }
-        return unavailableSnapshot(this.service, reason, "rate-limited");
+      // That process may have taken a 429 and armed a backoff while we waited.
+      // Re-checking under the lock is what makes the backoff shared: without it a
+      // caller that always refreshes would ask the vendor again immediately and
+      // deepen the limit the other process just hit.
+      const blockedUnderLock = this.whileBackedOff(
+        current,
+        lockedDecision,
+        currentSnapshot,
+        lockedNow,
+      );
+      if (blockedUnderLock) {
+        return blockedUnderLock;
       }
 
       let snapshot: UsageSnapshot;
@@ -268,24 +249,17 @@ export class CachingUsageProvider implements UsageProvider {
         if (snapshot.unavailableKind === "rate-limited") {
           this.recordRateLimit(snapshot, current);
         }
-        // The caller said a stale reading beats no reading. Serve the stored one
-        // tagged with what went wrong, so a panel can show figures and say they
-        // are not current. Callers that gate spending do not set `staleOk`, so
-        // they still see the failure.
-        // Re-sample the clock: the request we just awaited may have taken
-        // seconds, and the stored reading can have crossed the caller's
-        // staleness ceiling or had a window reset while we waited. Judging it by
-        // the instant we started would hand back a reading that is no longer
-        // eligible at the moment we return it.
+        // Judge the stored reading at the moment we return it, not the moment we
+        // started: the request we just awaited may have taken seconds, and the
+        // reading can have crossed the caller's staleness ceiling or had a window
+        // reset while we waited.
         const afterNow = this.now();
-        const afterDecision = this.freshness(currentSnapshot, afterNow);
-        const stale = afterDecision.use === "refresh" && afterDecision.staleOk
-          ? staleReading(currentSnapshot, afterNow)
-          : undefined;
-        if (stale) {
-          return { ...stale, refreshError: snapshot.unavailableReason };
-        }
-        return snapshot;
+        return this.staleFallback(
+          this.freshness(currentSnapshot, afterNow),
+          currentSnapshot,
+          afterNow,
+          snapshot.unavailableReason,
+        ) ?? snapshot;
       }
 
       const captured = { ...snapshot, capturedAt: this.now() };
@@ -296,36 +270,68 @@ export class CachingUsageProvider implements UsageProvider {
     }
   }
 
+  /**
+   * The stored reading a stale-tolerant caller may still be handed, tagged with
+   * what went wrong — or undefined when the policy or the reading itself says no.
+   *
+   * Every path that fails to produce a live reading ends here, which is the point:
+   * "a failed refresh falls back to the stored reading only when the caller opted
+   * in, and only to windows that have not reset" is the rule this package is most
+   * obliged to get right, and it now has one statement rather than one per exit.
+   *
+   * The clock is a parameter rather than a `this.now()` call, because the sites do
+   * not agree on which instant to judge: the one after an awaited request has to
+   * use the moment it returns.
+   */
+  private staleFallback(
+    decision: FreshnessDecision,
+    snapshot: UsageSnapshot | undefined,
+    now: number,
+    refreshError: string,
+  ): UsageSnapshot | undefined {
+    if (decision.use !== "refresh" || !decision.staleOk) {
+      return undefined;
+    }
+    const stale = staleReading(snapshot, now);
+    return stale === undefined ? undefined : { ...stale, refreshError };
+  }
+
+  /**
+   * The answer while a rate-limit backoff is in force, or undefined when it is
+   * not and the caller should carry on.
+   *
+   * The backoff says do not ask again; it does not say forget what we know, so a
+   * caller that accepts stale readings keeps seeing the stored one for the whole
+   * backoff rather than only on the call that armed it.
+   */
+  private whileBackedOff(
+    entry: CacheEntry | undefined,
+    decision: FreshnessDecision,
+    snapshot: UsageSnapshot | undefined,
+    now: number,
+  ): UsageSnapshot | undefined {
+    if (entry?.blockedUntil === undefined || entry.blockedUntil <= now) {
+      return undefined;
+    }
+    const reason = `rate limited; not retrying for ${Math.ceil((entry.blockedUntil - now) / 1000)}s`;
+    return this.staleFallback(decision, snapshot, now, reason)
+      ?? unavailableSnapshot(this.service, reason, "rate-limited");
+  }
+
   private lockPath(): string {
     return join(this.cacheDir, `${this.service}.lock`);
   }
 
-  private invalidPath(): string {
-    return invalidPath(this.cacheDir, this.service);
-  }
-
   private entryPath(): string {
-    return join(this.cacheDir, `${this.service}.json`);
+    return entryPath(this.cacheDir, this.service);
   }
 
   private readEntry(): CacheEntry | undefined {
-    let raw: string;
-    try {
-      raw = this.readFile(this.entryPath());
-    } catch {
-      return undefined;
-    }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      return undefined;
-    }
-    const entry = toCacheEntry(parsed);
+    const entry = toCacheEntry(readJson(this.entryPath(), this.readFile));
     if (entry === undefined) {
       return undefined;
     }
-    return withoutInvalidated(entry, readInvalidBefore(this.invalidPath(), this.readFile));
+    return withoutInvalidated(entry, readInvalidBefore(invalidPath(this.cacheDir, this.service), this.readFile));
   }
 
   /** A success replaces the entry outright, which also clears the backoff. */
@@ -337,20 +343,18 @@ export class CachingUsageProvider implements UsageProvider {
    * Arm an escalating backoff, keeping the stored reading. That reading is no
    * longer servable in place of this failed read, but it is still the baseline
    * `record` diffs its next "after" reading against. `previous` is the entry
-   * already read under the lock, so this never re-reads the file.
+   * already read under the lock, so this never re-reads the file — and it does
+   * not need to. Every other writer of the entry holds that same lock, and a
+   * reading an invalidation disqualified stays unservable however it is written
+   * back, because the cutoff that disqualifies it lives in its own file.
    */
   private recordRateLimit(snapshot: UsageSnapshot, previous: CacheEntry | undefined): void {
-    // Re-read rather than trusting the entry from before the request, so a
-    // reading another process recorded meanwhile is not overwritten. Restoring a
-    // snapshot this way is harmless now: the cutoff lives in its own file, so a
-    // reading an invalidation disqualified stays unservable however it returns.
-    const current = this.readEntry() ?? previous;
-    const failures = (current?.consecutiveFailures ?? 0) + 1;
+    const failures = (previous?.consecutiveFailures ?? 0) + 1;
     const backoffMs = Math.min(BASE_BACKOFF_MS * 2 ** (failures - 1), MAX_BACKOFF_MS);
     // Honor a server-provided deadline only when it asks us to wait longer than
     // our own floor; this endpoint's `retry-after: 0` must not shorten it.
     const blockedUntil = Math.max(this.now() + backoffMs, snapshot.retryAfter ?? 0);
-    this.writeEntry({ ...current, blockedUntil, consecutiveFailures: failures });
+    this.writeEntry({ ...previous, blockedUntil, consecutiveFailures: failures });
   }
 
   /**
@@ -413,7 +417,21 @@ function isReading(snapshot: UsageSnapshot | undefined): snapshot is UsageSnapsh
  * reading here. Age is not consulted; that is the caller's policy to decide.
  */
 function isCurrent(snapshot: UsageSnapshot | undefined, now: number): snapshot is UsageSnapshot {
-  return isReading(snapshot) && now < earliestReset(snapshot);
+  return isReading(snapshot) && snapshot.windows.every((window) => windowIsCurrent(window, now));
+}
+
+/**
+ * The window has not rolled over yet. A `resetsAt` of `0` is the "no scheduled
+ * reset" convention and never expires.
+ *
+ * One definition on purpose: this was spelled two different ways, and the two
+ * disagreed about a negative `resetsAt` — one treated it as "never resets" and
+ * served the reading as current, the other treated it as long past and dropped
+ * the window. `isCachedSnapshot` now rejects a negative outright, so the case
+ * cannot reach here, but the rule still belongs in one place.
+ */
+function windowIsCurrent(window: UsageWindow, now: number): boolean {
+  return window.resetsAt === 0 || now < window.resetsAt;
 }
 
 /**
@@ -431,24 +449,10 @@ function staleReading(snapshot: UsageSnapshot | undefined, now: number): UsageSn
   if (!isReading(snapshot)) {
     return undefined;
   }
-  const windows = snapshot.windows.filter((window) => window.resetsAt === 0 || now < window.resetsAt);
+  const windows = snapshot.windows.filter((window) => windowIsCurrent(window, now));
   return windows.length > 0 ? { ...snapshot, windows } : undefined;
 }
 
-/**
- * The soonest moment any of the snapshot's windows rolls over. A `resetsAt` of
- * `0` is the "no scheduled reset" convention and never expires the reading; a
- * snapshot made entirely of such windows returns `Infinity`.
- */
-function earliestReset(snapshot: UsageSnapshot): number {
-  let earliest = Number.POSITIVE_INFINITY;
-  for (const window of snapshot.windows) {
-    if (window.resetsAt > 0) {
-      earliest = Math.min(earliest, window.resetsAt);
-    }
-  }
-  return earliest;
-}
 
 /**
  * Validate a parsed cache file into an entry, or undefined when it is anything
@@ -464,11 +468,13 @@ function toCacheEntry(parsed: unknown): CacheEntry | undefined {
     return undefined;
   }
   const entry: CacheEntry = { version: CACHE_VERSION };
-  if (typeof parsed.blockedUntil === "number" && Number.isFinite(parsed.blockedUntil)) {
-    entry.blockedUntil = parsed.blockedUntil;
+  const blockedUntil = finiteNumber(parsed.blockedUntil);
+  if (blockedUntil !== undefined) {
+    entry.blockedUntil = blockedUntil;
   }
-  if (typeof parsed.consecutiveFailures === "number" && Number.isFinite(parsed.consecutiveFailures)) {
-    entry.consecutiveFailures = parsed.consecutiveFailures;
+  const consecutiveFailures = finiteNumber(parsed.consecutiveFailures);
+  if (consecutiveFailures !== undefined) {
+    entry.consecutiveFailures = consecutiveFailures;
   }
   if (isCachedSnapshot(parsed.snapshot)) {
     entry.snapshot = parsed.snapshot;
@@ -498,21 +504,34 @@ function withoutInvalidated(entry: CacheEntry, invalidBefore: number | undefined
  * carry the cutoff away with the snapshot it disqualifies.
  */
 function readInvalidBefore(path: string, readFile: (path: string) => string): number | undefined {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(readFile(path));
-  } catch {
-    return undefined;
-  }
+  const parsed = readJson(path, readFile);
   if (!isRecord(parsed) || parsed.version !== CACHE_VERSION) {
     return undefined;
   }
-  return typeof parsed.invalidBefore === "number" && Number.isFinite(parsed.invalidBefore)
-    ? parsed.invalidBefore
-    : undefined;
+  return finiteNumber(parsed.invalidBefore);
 }
 
-/** Path of the sidecar holding a service's invalidation cutoff. */
+/**
+ * A file's parsed JSON, or undefined for any reason it cannot be read as such.
+ *
+ * The contract is that a missing, unreadable, or corrupt file behaves as a miss,
+ * and it had three separate try/catch spellings enforcing it. Every caller feeds
+ * the result to a validator that already handles `undefined`.
+ */
+function readJson(path: string, readFile: (path: string) => string): unknown {
+  try {
+    return JSON.parse(readFile(path));
+  } catch {
+    return undefined;
+  }
+}
+
+/** Path of a service's cache entry. */
+function entryPath(cacheDir: string, service: UsageService): string {
+  return join(cacheDir, `${service}.json`);
+}
+
+/** Path of the sidecar holding a service's invalidation cutoff — its sibling. */
 function invalidPath(cacheDir: string, service: UsageService): string {
   return join(cacheDir, `${service}.invalid.json`);
 }
@@ -532,8 +551,8 @@ function isCachedSnapshot(value: unknown): value is UsageSnapshot {
         // to the rail that decides whether to dispatch work, so an out-of-range
         // value has to make the file a miss rather than a reading.
         percentInRange(window.usedPercent) !== undefined &&
-        typeof window.resetsAt === "number" &&
-        Number.isFinite(window.resetsAt),
+        // A negative reset is not a time; the file is corrupt, so it is a miss.
+        (finiteNumber(window.resetsAt) ?? -1) >= 0,
     )
   );
 }
@@ -581,7 +600,7 @@ export function invalidateCachedReading(
   const readFile = options.readFile ?? defaultReadFile;
   const write = options.writeFileAtomic ?? writeFileAtomic;
   const remove = options.removeFile ?? defaultRemoveFile;
-  const path = join(cacheDir, `${service}.json`);
+  const path = entryPath(cacheDir, service);
 
   const sidecar = invalidPath(cacheDir, service);
   const already = readInvalidBefore(sidecar, readFile);

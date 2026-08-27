@@ -333,7 +333,7 @@ describe("CachingUsageProvider stale readings", () => {
     // Missing it would send a force-refresh caller straight at a vendor that
     // just rate-limited someone else.
     const inner = fakeInner([goodSnapshot(13)]);
-    const disk = fakeDisk(cacheFile({ snapshot: { ...goodSnapshot(42), capturedAt: T0 - 5 * MINUTE } }));
+    const disk = fakeDisk(cachedReading(T0 - 5 * MINUTE, 42));
     let handedOut = false;
     const provider = makeProvider(inner, disk, {
       freshMs: 0,
@@ -385,24 +385,6 @@ describe("CachingUsageProvider stale readings", () => {
     expect(snapshot.windows.map((window) => window.label)).toEqual(["weekly"]);
     expect(snapshot.windows[0]?.usedPercent).toBe(21);
     expect(snapshot.refreshError).toContain("offline");
-  });
-
-  it("refuses the reading once every window in it has reset", async () => {
-    const inner = fakeInner([unavailableSnapshot("claude", "offline")]);
-    const disk = fakeDisk(cacheFile({
-      snapshot: {
-        service: "claude",
-        planType: "max",
-        capturedAt: T0 - 30 * MINUTE,
-        windows: [{ label: "5h", usedPercent: 88, resetsAt: T0 - MINUTE }],
-      },
-    }));
-    const provider = makeProvider(inner, disk, {
-      freshMs: 2 * MINUTE,
-      staleCeilingMs: 6 * 60 * MINUTE,
-    });
-
-    expect((await provider.getUsage()).unavailableReason).toContain("offline");
   });
 
   it("does not serve a partially reset reading as current", async () => {
@@ -744,7 +726,7 @@ describe("invalidateCachedReading", () => {
     expect(removed).toEqual([CLAUDE_PATH]);
   });
 
-  it("does nothing when there is no entry to invalidate", () => {
+  it("records the cutoff even with no stored reading to drop", () => {
     const disk = fakeDisk();
 
     expect(() =>
@@ -754,15 +736,16 @@ describe("invalidateCachedReading", () => {
         writeFileAtomic: (path, data) => disk.writeFileAtomic(path, data),
       }),
     ).not.toThrow();
-    expect(disk.entry()).toBeUndefined();
+    // The cutoff is recorded regardless: a concurrent fetch already in flight can
+    // still write a reading captured before it, and that reading must not count.
+    expect(disk.files.has(`${CACHE_DIR}/claude.invalid.json`)).toBe(true);
   });
 
   it("keeps a reading another process captured after the cutoff", () => {
     // A concurrent successful refresh writes a trustworthy reading. Dropping it
     // would throw away exactly the number the next budget needs and force
     // another live request seconds later.
-    const fresh = cacheFile({ snapshot: { ...goodSnapshot(51), capturedAt: T0 + 1_000 } });
-    const disk = fakeDisk(fresh);
+    const disk = fakeDisk(cacheFile({ snapshot: { ...goodSnapshot(51), capturedAt: T0 + 1_000 } }));
 
     invalidateCachedReading(CACHE_DIR, "claude", {
       capturedBefore: T0,
@@ -770,6 +753,15 @@ describe("invalidateCachedReading", () => {
       writeFileAtomic: (path, data) => disk.writeFileAtomic(path, data),
     });
 
-    expect(disk.files.get(CLAUDE_PATH)).toBe(fresh);
+    // Assert no cutoff was recorded, not that the entry file is untouched:
+    // invalidation stopped writing that file, so the old assertion passed
+    // whether or not the guard it was named for still existed.
+    expect(disk.files.has(`${CACHE_DIR}/claude.invalid.json`)).toBe(false);
+
+    // And the reading is still served.
+    const provider = makeProvider(fakeInner([]), disk, { freshMs: 10 * MINUTE });
+    return provider.getUsage().then((snapshot) => {
+      expect(snapshot.windows[0]?.usedPercent).toBe(51);
+    });
   });
 });

@@ -64,6 +64,19 @@ export interface UsageProvider {
 }
 
 /**
+ * A percentage in the 0–100 range `UsageWindow.usedPercent` is declared to hold,
+ * or undefined when the vendor sent something else — a missing scalar, a string,
+ * or a value outside the range. It lives here rather than beside the generic
+ * guards because the range is this file's contract, and a guard kept apart from
+ * the declaration it enforces is how a fourth spelling of it appears.
+ */
+export function percentInRange(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 100
+    ? value
+    : undefined;
+}
+
+/**
  * Classify an HTTP status. `429` is the transient rate limit the cache backs off
  * from; every other status simply makes the service unavailable for this read.
  */

@@ -9,8 +9,9 @@ import {
   type UsageSnapshot,
   type UsageUnavailableKind,
   type UsageWindow,
+  percentInRange,
 } from "../types.js";
-import { isRecord, percentInRange } from "../lib/values.js";
+import { isRecord } from "../lib/values.js";
 
 /** Anthropic OAuth usage endpoint (the same source `ccstatusline` reads). */
 const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";

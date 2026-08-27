@@ -19,14 +19,7 @@ export function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/**
- * A percentage in the 0–100 range `UsageWindow.usedPercent` is documented to
- * hold, or undefined when the vendor sent something else. Vendors do send
- * something else: a missing scalar, a string, or a value outside the range all
- * have to degrade rather than propagate.
- */
-export function percentInRange(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 100
-    ? value
-    : undefined;
+/** A real finite number, or undefined when the value is anything else. */
+export function finiteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
