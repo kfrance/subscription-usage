@@ -76,14 +76,21 @@ interface CacheEntry {
  * empty one, because nobody spends anything by looking at it. Both are correct
  * for their caller, so neither belongs in the store.
  */
-export type FreshnessDecision =
-  /** Serve the stored reading without any request. */
-  | { use: "cached" }
+export interface FreshnessDecision {
+  /** `cached` serves the stored reading without any request; `refresh` fetches. */
+  use: "cached" | "refresh";
   /**
-   * Fetch live. When `staleOk`, a failed fetch falls back to the stored reading,
-   * tagged with `refreshError` so the caller can say the figures are not current.
+   * A failed or skipped fetch may fall back to the stored reading, tagged with
+   * `refreshError` so the caller can say the figures are not current.
+   *
+   * Independent of `use` on purpose. A reading can be young enough to serve and
+   * still be rejected as current because one of its windows reset, and when that
+   * happens the caller's tolerance for stale figures still applies — otherwise a
+   * panel that asked for six hours of stale data loses a valid weekly reading the
+   * moment an unrelated five-hour window rolls over.
    */
-  | { use: "refresh"; staleOk?: boolean };
+  staleOk?: boolean;
+}
 
 /** Decide how a stored reading may be used. `snapshot` is undefined on a miss. */
 export type Freshness = (snapshot: UsageSnapshot | undefined, now: number) => FreshnessDecision;
@@ -103,10 +110,10 @@ export function maxAgeFreshness(options: {
       return { use: "refresh" };
     }
     const age = now - capturedAt;
-    if (options.freshMs > 0 && age < options.freshMs) {
-      return { use: "cached" };
-    }
-    return { use: "refresh", staleOk: age < staleCeilingMs };
+    const staleOk = age < staleCeilingMs;
+    return options.freshMs > 0 && age < options.freshMs
+      ? { use: "cached", staleOk }
+      : { use: "refresh", staleOk };
   };
 }
 
@@ -262,7 +269,12 @@ export class CachingUsageProvider implements UsageProvider {
         ) ?? snapshot;
       }
 
-      const captured = { ...snapshot, capturedAt: this.now() };
+      // Stamped when the request began, not when it returned. `record`
+      // invalidates readings captured before a dispatch it could not measure, and
+      // a request that started before that cutoff reflects pre-dispatch usage
+      // however long it takes to come back. Stamping the completion time would
+      // let such a reading land after the cutoff and be trusted for spending.
+      const captured = { ...snapshot, capturedAt: lockedNow };
       this.recordSuccess(captured);
       return captured;
     } finally {
@@ -289,7 +301,7 @@ export class CachingUsageProvider implements UsageProvider {
     now: number,
     refreshError: string,
   ): UsageSnapshot | undefined {
-    if (decision.use !== "refresh" || !decision.staleOk) {
+    if (!decision.staleOk) {
       return undefined;
     }
     const stale = staleReading(snapshot, now);

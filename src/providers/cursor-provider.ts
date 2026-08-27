@@ -79,13 +79,18 @@ export class CursorUsageProvider implements UsageProvider {
       // Leaving it in a bare Promise.all meant a network error or timeout there
       // rejected the pair and discarded a usage response that was independently
       // sufficient, which is the opposite of treating it as optional.
-      const [usageResponse, planSettled] = await Promise.all([
-        this.call("GetCurrentPeriodUsage", accessToken),
-        this.call("GetPlanInfo", accessToken).then(
-          (response) => response,
-          () => undefined,
-        ),
-      ]);
+      // Both requests start together, but the usage body is read as soon as it
+      // arrives rather than after the plan request settles. Each call carries its
+      // own AbortSignal.timeout, so waiting on a stalled plan request could burn
+      // the usage request's timeout too and make `response.json()` reject on a
+      // response that had already arrived intact.
+      const usagePromise = this.call("GetCurrentPeriodUsage", accessToken);
+      const planPromise = this.call("GetPlanInfo", accessToken).then(
+        (response) => response,
+        () => undefined,
+      );
+
+      const usageResponse = await usagePromise;
       if (!usageResponse.ok) {
         return unavailableSnapshot(
           "cursor",
@@ -94,14 +99,14 @@ export class CursorUsageProvider implements UsageProvider {
         );
       }
       const usage = await readJson<CursorUsagePayload>(usageResponse, "usage");
+
       // The plan call supplies the tier label and a fallback reset instant, both
       // optional: `planType` is documented as "" when unavailable, and the usage
-      // payload normally carries its own `billingCycleEnd`. Treating a failure
-      // here as fatal discarded complete, usable percentages over missing
-      // metadata. If the usage payload also lacks a reset, normalization reports
-      // the snapshot unavailable on its own.
-      const plan = planSettled?.ok
-        ? await readJson<CursorPlanPayload>(planSettled, "plan").catch(() => ({}))
+      // payload normally carries its own `billingCycleEnd`. If the usage payload
+      // also lacks a reset, normalization reports the snapshot unavailable.
+      const planResponse = await planPromise;
+      const plan = planResponse?.ok
+        ? await readJson<CursorPlanPayload>(planResponse, "plan").catch(() => ({}))
         : {};
       return normalizeCursorUsage(usage, plan);
     } catch (error) {

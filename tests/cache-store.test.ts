@@ -431,6 +431,34 @@ describe("CachingUsageProvider stale readings", () => {
     expect(snapshot.windows[0]?.usedPercent).toBe(13);
   });
 
+  it("keeps stale permission when a young reading has a reset window", async () => {
+    // The reading is inside the fresh window by age, so the policy says "cached",
+    // but one of its windows has rolled over so it cannot be served as current.
+    // The caller's six-hour tolerance still applies to what is left of it.
+    const inner = fakeInner([unavailableSnapshot("claude", "offline")]);
+    const disk = fakeDisk(cacheFile({
+      snapshot: {
+        service: "claude",
+        planType: "max",
+        capturedAt: T0 - 30_000,
+        windows: [
+          { label: "5h", usedPercent: 88, resetsAt: T0 - 1_000 },
+          { label: "weekly", usedPercent: 21, resetsAt: T0 + 3 * 24 * 60 * MINUTE },
+        ],
+      },
+    }));
+    const provider = makeProvider(inner, disk, {
+      freshMs: 2 * MINUTE,
+      staleCeilingMs: 6 * 60 * MINUTE,
+    });
+
+    const snapshot = await provider.getUsage();
+
+    expect(snapshot.unavailableReason).toBeUndefined();
+    expect(snapshot.windows.map((window) => window.label)).toEqual(["weekly"]);
+    expect(snapshot.refreshError).toContain("offline");
+  });
+
   it("still refuses a stale reading whose window has already reset", async () => {
     // A reset only lowers utilization, so a reading taken before one overstates
     // spend. Serving it as stale would be worse than saying nothing.
@@ -613,6 +641,37 @@ describe("CachingUsageProvider request collapsing", () => {
     // byte-for-byte rather than merged and rewritten.
     expect(disk.files.get(CLAUDE_PATH)).toBe(cachedReading(T0 - 30 * MINUTE, 42));
     expect(disk.entry("codex")?.snapshot?.capturedAt).toBe(T0);
+  });
+});
+
+describe("CachingUsageProvider capture time", () => {
+  it("stamps a reading with the moment the request began", async () => {
+    // `record` invalidates readings captured before a dispatch it could not
+    // measure. A request that started before that cutoff reflects pre-dispatch
+    // usage however long it takes to return, so stamping the completion time
+    // would let it land after the cutoff and be trusted for spending.
+    const disk = fakeDisk();
+    let clock = T0;
+    const inner: UsageProvider = {
+      service: "claude",
+      getUsage: async () => {
+        clock = T0 + 5 * MINUTE; // the request takes a while
+        return goodSnapshot(13);
+      },
+    };
+    const provider = new CachingUsageProvider(inner, {
+      cacheDir: CACHE_DIR,
+      now: () => clock,
+      freshness: maxAgeFreshness({ freshMs: 0 }),
+      readFile: (path) => disk.readFile(path),
+      writeFileAtomic: (path, data) => disk.writeFileAtomic(path, data),
+      acquireLock: noopLock,
+    });
+
+    const snapshot = await provider.getUsage();
+
+    expect(snapshot.capturedAt).toBe(T0);
+    expect(disk.entry()?.snapshot?.capturedAt).toBe(T0);
   });
 });
 
