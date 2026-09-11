@@ -54,6 +54,24 @@ const BILLING_BODY = {
   },
 };
 
+/** Billing shape observed live at 0%, before explicit 1% and 2% readings. */
+function zeroUsageConfig(): Record<string, unknown> {
+  return {
+    currentPeriod: {
+      type: "USAGE_PERIOD_TYPE_WEEKLY",
+      start: "2026-08-12T14:22:51.849236+00:00",
+      end: "2026-08-19T14:22:51.849236+00:00",
+    },
+    onDemandCap: { val: 0 },
+    onDemandUsed: { val: 0 },
+    isUnifiedBillingUser: true,
+    prepaidBalance: { val: 0 },
+    topUpMethod: "TOP_UP_METHOD_SAVED_PAYMENT_METHOD",
+    billingPeriodStart: "2026-08-12T14:22:51.849236+00:00",
+    billingPeriodEnd: "2026-08-19T14:22:51.849236+00:00",
+  };
+}
+
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -113,53 +131,60 @@ describe("GrokUsageProvider", () => {
     });
   });
 
-  it("treats Grok's explicit post-reset zero-credit shape as 0% used", async () => {
+  it.each([
+    "2026-08-12T14:22:51.849Z",
+    "2026-08-12T15:52:51.849Z",
+    "2026-08-12T20:22:51.850Z",
+    "2026-08-13T14:22:51.849Z",
+    "2026-08-19T14:22:51.848Z",
+  ])("reads omitted default usage as 0% throughout the active week at %s", async (observedAt) => {
     const { authPath } = writeAuthFile(baseEntry());
     const provider = new GrokUsageProvider({
       authPath,
-      now: () => Date.parse("2026-08-12T15:52:51.849236+00:00"),
+      now: () => Date.parse(observedAt),
+      fetchImpl: (async () => jsonResponse({ config: zeroUsageConfig() })) as typeof fetch,
+    });
+
+    await expect(provider.getUsage()).resolves.toEqual({
+      service: "grok",
+      planType: "",
+      windows: [{
+        label: "weekly",
+        usedPercent: 0,
+        resetsAt: Date.parse("2026-08-19T14:22:51.849Z"),
+      }],
+    });
+  });
+
+  it.each([0, 1, 2])("preserves an explicit %s%% reading with the same zero-credit fields", async (usage) => {
+    const { authPath } = writeAuthFile(baseEntry());
+    const provider = new GrokUsageProvider({
+      authPath,
+      now: () => Date.parse("2026-08-13T14:22:51.849Z"),
       fetchImpl: (async () => jsonResponse({
         config: {
-          currentPeriod: {
-            type: "USAGE_PERIOD_TYPE_WEEKLY",
-            start: "2026-08-12T14:22:51.849236+00:00",
-            end: "2026-08-19T14:22:51.849236+00:00",
-          },
-          onDemandCap: { val: 0 },
-          onDemandUsed: { val: 0 },
-          isUnifiedBillingUser: true,
-          prepaidBalance: { val: 0 },
-          topUpMethod: "TOP_UP_METHOD_SAVED_PAYMENT_METHOD",
-          billingPeriodStart: "2026-08-12T14:22:51.849236+00:00",
-          billingPeriodEnd: "2026-08-19T14:22:51.849236+00:00",
+          ...zeroUsageConfig(),
+          creditUsagePercent: usage,
+          productUsage: [{ product: "GrokBuild", usagePercent: usage }],
         },
       })) as typeof fetch,
     });
 
     await expect(provider.getUsage()).resolves.toMatchObject({
-      service: "grok",
-      windows: [{
-        label: "weekly",
-        usedPercent: 0,
-        resetsAt: Date.parse("2026-08-19T14:22:51.849236+00:00"),
-      }],
+      windows: [{ label: "weekly", usedPercent: usage }],
     });
   });
 
-  it("does not infer 0% from an incomplete zero-overage response", async () => {
+  it.each([
+    "2026-08-12T14:22:51.848Z",
+    "2026-08-19T14:22:51.849Z",
+    "2026-08-20T14:22:51.849Z",
+  ])("does not infer 0% outside the reported period at %s", async (observedAt) => {
     const { authPath } = writeAuthFile(baseEntry());
     const provider = new GrokUsageProvider({
       authPath,
-      now: () => Date.parse("2026-08-12T18:22:51.849236+00:00"),
-      fetchImpl: (async () => jsonResponse({
-        config: {
-          currentPeriod: {
-            start: "2026-08-12T14:22:51.849236+00:00",
-            end: "2026-08-19T14:22:51.849236+00:00",
-          },
-          onDemandUsed: { val: 0 },
-        },
-      })) as typeof fetch,
+      now: () => Date.parse(observedAt),
+      fetchImpl: (async () => jsonResponse({ config: zeroUsageConfig() })) as typeof fetch,
     });
 
     await expect(provider.getUsage()).resolves.toMatchObject({
@@ -168,26 +193,27 @@ describe("GrokUsageProvider", () => {
     });
   });
 
-  it("does not infer 0% from the zero-credit shape late in the billing week", async () => {
+  it.each([
+    ["missing period type", { currentPeriod: {
+      start: "2026-08-12T14:22:51.849236+00:00",
+      end: "2026-08-19T14:22:51.849236+00:00",
+    } }],
+    ["missing credit field", { onDemandCap: undefined }],
+    ["nonzero credits", { onDemandUsed: { val: 1 } }],
+    ["mismatched periods", { billingPeriodStart: "2026-08-13T14:22:51.849Z" }],
+    ["null percentage", { creditUsagePercent: null }],
+    ["string percentage", { creditUsagePercent: "0" }],
+    ["negative percentage", { creditUsagePercent: -1 }],
+    ["out-of-range percentage", { creditUsagePercent: 101 }],
+    ["malformed product usage", { productUsage: {} }],
+    ["missing product percentage", { productUsage: [{ product: "GrokBuild" }] }],
+  ])("does not infer 0% from %s", async (_label, overrides) => {
     const { authPath } = writeAuthFile(baseEntry());
     const provider = new GrokUsageProvider({
       authPath,
-      now: () => Date.parse("2026-08-13T14:22:51.849236+00:00"),
+      now: () => Date.parse("2026-08-13T14:22:51.849Z"),
       fetchImpl: (async () => jsonResponse({
-        config: {
-          currentPeriod: {
-            type: "USAGE_PERIOD_TYPE_WEEKLY",
-            start: "2026-08-12T14:22:51.849236+00:00",
-            end: "2026-08-19T14:22:51.849236+00:00",
-          },
-          onDemandCap: { val: 0 },
-          onDemandUsed: { val: 0 },
-          isUnifiedBillingUser: true,
-          prepaidBalance: { val: 0 },
-          topUpMethod: "TOP_UP_METHOD_SAVED_PAYMENT_METHOD",
-          billingPeriodStart: "2026-08-12T14:22:51.849236+00:00",
-          billingPeriodEnd: "2026-08-19T14:22:51.849236+00:00",
-        },
+        config: { ...zeroUsageConfig(), ...overrides },
       })) as typeof fetch,
     });
 

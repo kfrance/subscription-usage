@@ -41,7 +41,6 @@ const BILLING_TIMEOUT_MS = 5000;
 /** Token refresh timeout; keeps a stalled Grok refresh from blocking peers. */
 const TOKEN_TIMEOUT_MS = 5000;
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
-const ZERO_USAGE_INFERENCE_WINDOW_MS = 6 * 60 * 60 * 1000;
 /** Restrictive mode for the rewritten credential file (owner read/write). */
 const AUTH_FILE_MODE = 0o600;
 
@@ -358,9 +357,9 @@ function normalizeBilling(json: unknown, observedAt: number): UsageSnapshot {
     }
   }
   // Grok's protobuf-shaped JSON omits its scalar percentage when that value is
-  // the default zero. Accept 0% only for the complete canonical empty-period
-  // shape observed from the live endpoint; partial or drifted responses remain
-  // unavailable rather than becoming a misleading zero.
+  // the default zero, including beyond the first day of the billing week.
+  // Accept 0% only for the complete canonical shape within its active period;
+  // partial or drifted responses remain unavailable rather than becoming zero.
   if (usedPercent === undefined && isCanonicalZeroUsagePeriod(config, observedAt)) {
     usedPercent = 0;
   }
@@ -421,6 +420,8 @@ function isCanonicalZeroUsagePeriod(
   observedAt: number
 ): boolean {
   if (
+    "creditUsagePercent" in config ||
+    "productUsage" in config ||
     !isRecord(config.currentPeriod) ||
     config.currentPeriod.type !== "USAGE_PERIOD_TYPE_WEEKLY" ||
     typeof config.currentPeriod.start !== "string" ||
@@ -442,7 +443,7 @@ function isCanonicalZeroUsagePeriod(
     !Number.isNaN(end) &&
     end - start === WEEK_MS &&
     observedAt >= start &&
-    observedAt - start <= ZERO_USAGE_INFERENCE_WINDOW_MS
+    observedAt < end
   );
 }
 
