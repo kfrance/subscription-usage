@@ -298,9 +298,12 @@ export class CachingUsageProvider implements UsageProvider {
         return attempt.done;
       }
       // A stale reading the caller accepts is already an answer; only an
-      // unavailable one is worth waiting to replace.
+      // unavailable one is worth waiting to replace. A rate-limit backoff that
+      // outlasts the wait is also final: no process calls during a backoff, so
+      // no newer reading can appear before it ends.
       const now = this.now();
-      if (attempt.blocked.refreshError !== undefined || !(now < deadline)) {
+      const backoffOutlastsWait = attempt.blocked.unavailableKind === "rate-limited" && attempt.retryAt > deadline;
+      if (attempt.blocked.refreshError !== undefined || backoffOutlastsWait || !(now < deadline)) {
         return attempt.blocked;
       }
       const wakeAt = Math.min(attempt.retryAt, now + WAIT_POLL_MS, deadline);

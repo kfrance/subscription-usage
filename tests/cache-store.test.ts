@@ -1000,6 +1000,18 @@ describe("CachingUsageProvider spacing and waiting", () => {
     expect(snapshot.refreshError).toContain("next read allowed");
   });
 
+  it("does not wait through a rate-limit backoff that outlasts its wait", async () => {
+    const inner = fakeInner([goodSnapshot(13)]);
+    const disk = fakeDisk(cacheFile({ blockedUntil: T0 + 4 * MINUTE, consecutiveFailures: 3, lastAttemptAt: T0 - MINUTE }));
+    const { provider, clock } = spaced(inner, disk, { maxWaitMs: 2 * MINUTE });
+
+    const snapshot = await provider.getUsage();
+
+    expect(clock.slept).toEqual([]);
+    expect(inner.calls).toBe(0);
+    expect(snapshot.unavailableKind).toBe("rate-limited");
+  });
+
   it("keeps checking until its wait runs out, then gives up", async () => {
     const inner = fakeInner([goodSnapshot(13)]);
     const disk = fakeDisk();
