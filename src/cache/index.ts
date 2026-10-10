@@ -8,10 +8,12 @@
  */
 export {
   CachingUsageProvider,
+  capturedAfterFreshness,
   defaultCacheDir,
   invalidateCachedReading,
   maxAgeFreshness,
   type CachingUsageProviderOptions,
+  type CallLogEntry,
   type Freshness,
   type FreshnessDecision,
   type InvalidateOptions,

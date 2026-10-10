@@ -45,7 +45,7 @@ barrel export.
 | --- | --- |
 | `@kfrance/subscription-usage/types` | `UsageSnapshot`, `UsageWindow`, `UsageProvider`, `unavailableSnapshot` |
 | `@kfrance/subscription-usage/providers` | One provider class per vendor |
-| `@kfrance/subscription-usage/cache` | `CachedUsageStore` and its options |
+| `@kfrance/subscription-usage/cache` | `CachingUsageProvider`, the freshness policies, and `invalidateCachedReading` |
 | `@kfrance/subscription-usage/subscriptions` | Reader for the machine-local subscription inventory |
 | `@kfrance/subscription-usage/lib` | File locking, atomic writes, command execution |
 
@@ -58,10 +58,22 @@ The subscription inventory is read from
 Cached readings live in
 `${XDG_STATE_HOME:-~/.local/state}/learnwhale/ai-usage/`, one file per service
 plus a small `<service>.invalid.json` recording when a reading was ruled out,
-overridable with `AI_USAGE_CACHE_DIR`. That directory is deliberately outside
+overridable with `AI_USAGE_CACHE_DIR`. The same directory holds `calls.log`, one
+JSON line per live call to a vendor (time, service, caller, outcome), moved aside
+to `calls.log.1` at 1 MB. That directory is deliberately outside
 either application's checkout so both processes find the same readings, and it
 sits under `learnwhale/` because that is the path LearnWhale's unattended
 automation sandbox already grants write access to.
+
+## Reading rules
+
+Every reader on the machine goes through the cache, so it is the one place live
+calls are rationed. No service is called within 90 seconds of the last attempt,
+by any process, and not at all during a rate-limit backoff. A caller that cannot
+use the stored reading gets the service as unavailable, or, with `maxWaitMs`,
+waits for the next allowed call or for another process's reading. How fresh a
+reading must be is each caller's `Freshness` policy; `capturedAfterFreshness`
+asks for one taken after a given moment.
 
 ## Consuming this package
 

@@ -1,4 +1,4 @@
-import { readFileSync, rmSync } from "node:fs";
+import { appendFileSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { writeFileAtomic } from "../lib/atomic-file.js";
@@ -38,6 +38,13 @@ import { describeError, finiteNumber, isRecord } from "../lib/values.js";
  * skips the request entirely rather than spending another token from an empty
  * bucket, and a per-service lock keeps two processes from fetching at once.
  *
+ * Every program on the machine that reads usage goes through here, so this is
+ * also where live calls are spaced: no service is asked again within
+ * `MIN_LIVE_READ_SPACING_MS` of the last attempt, whoever made it. A caller that
+ * cannot use the stored reading may wait (`maxWaitMs`) for the next allowed read
+ * instead of being told the service is unavailable, and every live call is
+ * logged to `calls.log` in the cache directory.
+ *
  * Each service owns its own file inside the cache directory, so two commands
  * refreshing different services never write the same file and cannot lose each
  * other's entry.
@@ -49,8 +56,25 @@ import { describeError, finiteNumber, isRecord } from "../lib/values.js";
 
 /** First backoff step after a rate limit; the measured recovery is ~60s. */
 const BASE_BACKOFF_MS = 60_000;
-/** Backoff ceiling, matching what `ccstatusline` applies to the same endpoint. */
+/** Backoff ceiling. */
 const MAX_BACKOFF_MS = 300_000;
+/**
+ * The shortest gap between two live calls for one service, from any process.
+ * Anthropic's endpoint needs about a minute to recover from requests seconds
+ * apart, and has never refused reads two minutes apart; 90s keeps a margin over
+ * the first. The other vendors have never refused a read, and one rule for every
+ * service is simpler than a table.
+ */
+const MIN_LIVE_READ_SPACING_MS = 90_000;
+/** How long a waiting caller pauses before checking a lock another process holds. */
+const LOCK_RETRY_MS = 1_000;
+/**
+ * How often a waiting caller rechecks the shared reading while the spacing holds
+ * it back: another process's request may land well before the next allowed call.
+ */
+const WAIT_POLL_MS = 5_000;
+/** `calls.log` is moved aside to `calls.log.1` once it passes this size. */
+const CALL_LOG_MAX_BYTES = 1_000_000;
 /** Owner read/write only; the cache mirrors subscription usage figures. */
 const CACHE_FILE_MODE = 0o600;
 const CACHE_VERSION = 1;
@@ -65,6 +89,12 @@ interface CacheEntry {
   snapshot?: UsageSnapshot;
   blockedUntil?: number;
   consecutiveFailures?: number;
+  /**
+   * When the last live call that reached the vendor began. Kept apart from the
+   * reading's own `capturedAt` because an invalidation hides the reading, and the
+   * spacing has to survive that: the vendor saw the call either way.
+   */
+  lastAttemptAt?: number;
 }
 
 /**
@@ -118,6 +148,50 @@ export function maxAgeFreshness(options: {
 }
 
 /**
+ * Serve only a reading captured at or after `after`, with no stale tier: the
+ * policy for a caller measuring what happened since a moment, such as usage
+ * after a dispatch finished. Paired with `maxWaitMs`, it takes the first
+ * qualifying reading, whichever process writes it.
+ */
+export function capturedAfterFreshness(after: number): Freshness {
+  return (snapshot) =>
+    snapshot?.capturedAt !== undefined && snapshot.capturedAt >= after
+      ? { use: "cached" }
+      : { use: "refresh" };
+}
+
+/** One line of `calls.log`: a live call this cache made to a vendor. */
+export interface CallLogEntry {
+  /** ISO time the call began. */
+  at: string;
+  service: UsageService;
+  /** The `caller` option of the process that made it. */
+  caller: string;
+  outcome: "ok" | "rate-limited" | "failed";
+  ms: number;
+  reason?: string;
+}
+
+/**
+ * Append one line to the call log, moving a log past 1 MB aside first so it
+ * stays small. Best effort: a log that cannot be written never fails a read.
+ */
+export function appendCallLog(path: string, entry: CallLogEntry, maxBytes = CALL_LOG_MAX_BYTES): void {
+  try {
+    try {
+      if (statSync(path).size > maxBytes) {
+        renameSync(path, `${path}.1`);
+      }
+    } catch {
+      // No log yet.
+    }
+    appendFileSync(path, `${JSON.stringify(entry)}\n`, { mode: CACHE_FILE_MODE });
+  } catch {
+    // Logging is diagnostic only.
+  }
+}
+
+/**
  * Where readings live by default.
  *
  * A user-level path, not a repository one, because the point is that separate
@@ -155,10 +229,27 @@ export interface CachingUsageProviderOptions {
   removeFile?: (path: string) => void;
   /** Injectable lock acquisition; defaults to the shared file lock. */
   acquireLock?: (lockPath: string, label: string) => LockHandle;
+  /**
+   * How long to wait for the next allowed live read (or for another process's
+   * fetch) rather than return the service as unavailable. Defaults to 0.
+   */
+  maxWaitMs?: number;
+  /** Injectable pause used while waiting; defaults to a timer. */
+  sleep?: (ms: number) => Promise<void>;
+  /** Who is reading, for `calls.log` (for example `meta-loop record`). */
+  caller?: string;
+  /** Injectable call logger; defaults to appending to `calls.log`. */
+  logCall?: (entry: CallLogEntry) => void;
 }
+
+/** What one pass of `getUsage` produced: an answer, or a wait and its fallback. */
+type Attempt =
+  | { done: UsageSnapshot }
+  | { blocked: UsageSnapshot; retryAt: number };
 
 const defaultReadFile = (path: string): string => readFileSync(path, "utf8");
 const defaultRemoveFile = (path: string): void => rmSync(path, { force: true });
+const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 export class CachingUsageProvider implements UsageProvider {
   readonly service: UsageService;
@@ -171,6 +262,10 @@ export class CachingUsageProvider implements UsageProvider {
   private readonly writeFileAtomic: (path: string, data: string, mode?: number) => void;
   private readonly removeFile: (path: string) => void;
   private readonly acquireLock: (lockPath: string, label: string) => LockHandle;
+  private readonly maxWaitMs: number;
+  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly caller: string;
+  private readonly logCall: (entry: CallLogEntry) => void;
 
   constructor(inner: UsageProvider, options: CachingUsageProviderOptions) {
     this.inner = inner;
@@ -182,22 +277,49 @@ export class CachingUsageProvider implements UsageProvider {
     this.writeFileAtomic = options.writeFileAtomic ?? writeFileAtomic;
     this.removeFile = options.removeFile ?? defaultRemoveFile;
     this.acquireLock = options.acquireLock ?? acquireFileLock;
+    this.maxWaitMs = options.maxWaitMs ?? 0;
+    this.sleep = options.sleep ?? defaultSleep;
+    this.caller = options.caller ?? "unknown";
+    this.logCall = options.logCall ??
+      ((entry) => appendCallLog(join(this.cacheDir, "calls.log"), entry));
   }
 
+  /**
+   * The reading the caller's policy accepts, fetching live only when the shared
+   * spacing, backoff, and lock allow it. A caller with `maxWaitMs` sleeps until
+   * the next allowed moment and tries again; it may then find another process's
+   * reading, which costs no call at all.
+   */
   async getUsage(): Promise<UsageSnapshot> {
+    const deadline = this.now() + this.maxWaitMs;
+    for (;;) {
+      const attempt = await this.attempt();
+      if ("done" in attempt) {
+        return attempt.done;
+      }
+      // A stale reading the caller accepts is already an answer; only an
+      // unavailable one is worth waiting to replace.
+      const now = this.now();
+      if (attempt.blocked.refreshError !== undefined || !(now < deadline)) {
+        return attempt.blocked;
+      }
+      const wakeAt = Math.min(attempt.retryAt, now + WAIT_POLL_MS, deadline);
+      await this.sleep(Math.max(wakeAt - now, 0));
+    }
+  }
+
+  private async attempt(): Promise<Attempt> {
     const now = this.now();
     const entry = this.readEntry();
     const stored = entry?.snapshot;
     const decision = this.freshness(stored, now);
 
-    // Recent enough to reuse outright, as judged by the caller's policy. A
-    // policy that always refreshes is what LearnWhale's `record` wants: it diffs
-    // a before reading against an after reading, so it needs a live one.
+    // Recent enough to reuse outright, as judged by the caller's policy.
     if (decision.use === "cached" && isCurrent(stored, now)) {
-      return stored;
+      return { done: stored };
     }
 
-    const blocked = this.whileBackedOff(entry, decision, stored, now);
+    const blocked = this.whileBlocked(entry, decision, stored, now);
     if (blocked) {
       return blocked;
     }
@@ -212,8 +334,10 @@ export class CachingUsageProvider implements UsageProvider {
       lock = this.acquireLock(this.lockPath(), `${this.service} usage fetch`);
     } catch {
       const reason = "another process is reading usage";
-      return this.staleFallback(decision, stored, now, reason)
-        ?? unavailableSnapshot(this.service, reason);
+      return {
+        blocked: this.staleFallback(decision, stored, now, reason) ?? unavailableSnapshot(this.service, reason),
+        retryAt: now + LOCK_RETRY_MS,
+      };
     }
 
     try {
@@ -225,14 +349,14 @@ export class CachingUsageProvider implements UsageProvider {
       const currentSnapshot = current?.snapshot;
       const lockedDecision = this.freshness(currentSnapshot, lockedNow);
       if (lockedDecision.use === "cached" && isCurrent(currentSnapshot, lockedNow)) {
-        return currentSnapshot;
+        return { done: currentSnapshot };
       }
 
       // That process may have taken a 429 and armed a backoff while we waited.
       // Re-checking under the lock is what makes the backoff shared: without it a
       // caller that always refreshes would ask the vendor again immediately and
       // deepen the limit the other process just hit.
-      const blockedUnderLock = this.whileBackedOff(
+      const blockedUnderLock = this.whileBlocked(
         current,
         lockedDecision,
         currentSnapshot,
@@ -242,31 +366,36 @@ export class CachingUsageProvider implements UsageProvider {
         return blockedUnderLock;
       }
 
+      // Count the attempt before making it, so a reader stopped mid-request
+      // still holds every other process to the spacing.
+      this.writeEntry({ ...current, lastAttemptAt: lockedNow });
       let snapshot: UsageSnapshot;
       try {
         snapshot = await this.inner.getUsage();
       } catch (error) {
         snapshot = unavailableSnapshot(this.service, describeError(error));
       }
+      this.logLiveCall(snapshot, lockedNow);
 
       if (snapshot.unavailableReason) {
-        // Only a rate limit changes what is stored. Any other failure has nothing
-        // to persist, and writing the entry back unchanged would rewrite the
-        // whole cache file for nothing.
-        if (snapshot.unavailableKind === "rate-limited") {
-          this.recordRateLimit(snapshot, current);
-        }
         // Judge the stored reading at the moment we return it, not the moment we
         // started: the request we just awaited may have taken seconds, and the
         // reading can have crossed the caller's staleness ceiling or had a window
         // reset while we waited.
         const afterNow = this.now();
-        return this.staleFallback(
+        const result = this.staleFallback(
           this.freshness(currentSnapshot, afterNow),
           currentSnapshot,
           afterNow,
           snapshot.unavailableReason,
         ) ?? snapshot;
+        // Only a rate limit changes what is stored beyond the attempt already
+        // recorded; any other failure leaves the reading and backoff as they were.
+        if (snapshot.unavailableKind === "rate-limited") {
+          const armed = this.recordRateLimit(snapshot, current, lockedNow);
+          return { blocked: result, retryAt: nextAllowedAt(armed) };
+        }
+        return { done: result };
       }
 
       // Stamped when the request began, not when it returned. `record`
@@ -276,7 +405,7 @@ export class CachingUsageProvider implements UsageProvider {
       // let such a reading land after the cutoff and be trusted for spending.
       const captured = { ...snapshot, capturedAt: lockedNow };
       this.recordSuccess(captured);
-      return captured;
+      return { done: captured };
     } finally {
       lock.release();
     }
@@ -309,25 +438,51 @@ export class CachingUsageProvider implements UsageProvider {
   }
 
   /**
-   * The answer while a rate-limit backoff is in force, or undefined when it is
-   * not and the caller should carry on.
+   * The answer while a live call is not allowed yet, because a rate-limit backoff
+   * is in force or the last attempt was too recent, or undefined when the caller
+   * may go ahead.
    *
-   * The backoff says do not ask again; it does not say forget what we know, so a
-   * caller that accepts stale readings keeps seeing the stored one for the whole
-   * backoff rather than only on the call that armed it.
+   * Neither says forget what we know, so a caller that accepts stale readings
+   * keeps seeing the stored one for the whole wait.
    */
-  private whileBackedOff(
+  private whileBlocked(
     entry: CacheEntry | undefined,
     decision: FreshnessDecision,
     snapshot: UsageSnapshot | undefined,
     now: number,
-  ): UsageSnapshot | undefined {
-    if (entry?.blockedUntil === undefined || entry.blockedUntil <= now) {
+  ): Attempt | undefined {
+    const retryAt = nextAllowedAt(entry);
+    if (retryAt <= now) {
       return undefined;
     }
-    const reason = `rate limited; not retrying for ${Math.ceil((entry.blockedUntil - now) / 1000)}s`;
-    return this.staleFallback(decision, snapshot, now, reason)
-      ?? unavailableSnapshot(this.service, reason, "rate-limited");
+    const seconds = Math.ceil((retryAt - now) / 1000);
+    const rateLimited = (entry?.blockedUntil ?? 0) > now;
+    const reason = rateLimited
+      ? `rate limited; not retrying for ${seconds}s`
+      : `usage was read moments ago; next read allowed in ${seconds}s`;
+    return {
+      blocked: this.staleFallback(decision, snapshot, now, reason)
+        ?? unavailableSnapshot(this.service, reason, rateLimited ? "rate-limited" : undefined),
+      retryAt,
+    };
+  }
+
+  private logLiveCall(snapshot: UsageSnapshot, startedAt: number): void {
+    const outcome = !snapshot.unavailableReason
+      ? "ok"
+      : snapshot.unavailableKind === "rate-limited" ? "rate-limited" : "failed";
+    try {
+      this.logCall({
+        at: new Date(startedAt).toISOString(),
+        service: this.service,
+        caller: this.caller,
+        outcome,
+        ms: Math.max(this.now() - startedAt, 0),
+        ...(snapshot.unavailableReason ? { reason: snapshot.unavailableReason.slice(0, 200) } : {}),
+      });
+    } catch {
+      // The log is diagnostic; it never fails a read.
+    }
   }
 
   private lockPath(): string {
@@ -348,7 +503,7 @@ export class CachingUsageProvider implements UsageProvider {
 
   /** A success replaces the entry outright, which also clears the backoff. */
   private recordSuccess(snapshot: UsageSnapshot): void {
-    this.writeEntry({ snapshot });
+    this.writeEntry({ snapshot, lastAttemptAt: snapshot.capturedAt });
   }
 
   /**
@@ -360,13 +515,19 @@ export class CachingUsageProvider implements UsageProvider {
    * reading an invalidation disqualified stays unservable however it is written
    * back, because the cutoff that disqualifies it lives in its own file.
    */
-  private recordRateLimit(snapshot: UsageSnapshot, previous: CacheEntry | undefined): void {
+  private recordRateLimit(
+    snapshot: UsageSnapshot,
+    previous: CacheEntry | undefined,
+    attemptedAt: number,
+  ): Omit<CacheEntry, "version"> {
     const failures = (previous?.consecutiveFailures ?? 0) + 1;
     const backoffMs = Math.min(BASE_BACKOFF_MS * 2 ** (failures - 1), MAX_BACKOFF_MS);
     // Honor a server-provided deadline only when it asks us to wait longer than
     // our own floor; this endpoint's `retry-after: 0` must not shorten it.
     const blockedUntil = Math.max(this.now() + backoffMs, snapshot.retryAfter ?? 0);
-    this.writeEntry({ ...previous, blockedUntil, consecutiveFailures: failures });
+    const armed = { ...previous, blockedUntil, consecutiveFailures: failures, lastAttemptAt: attemptedAt };
+    this.writeEntry(armed);
+    return armed;
   }
 
   /**
@@ -377,6 +538,17 @@ export class CachingUsageProvider implements UsageProvider {
   private writeEntry(state: Omit<CacheEntry, "version">): void {
     writeCacheEntry(this.entryPath(), state, this.writeFileAtomic, this.removeFile);
   }
+}
+
+/**
+ * The earliest moment a live call is allowed: after any rate-limit backoff, and
+ * at least `MIN_LIVE_READ_SPACING_MS` after the last attempt.
+ */
+function nextAllowedAt(entry: Omit<CacheEntry, "version"> | undefined): number {
+  return Math.max(
+    entry?.blockedUntil ?? 0,
+    entry?.lastAttemptAt === undefined ? 0 : entry.lastAttemptAt + MIN_LIVE_READ_SPACING_MS,
+  );
 }
 
 /**
@@ -488,9 +660,16 @@ function toCacheEntry(parsed: unknown): CacheEntry | undefined {
   if (consecutiveFailures !== undefined) {
     entry.consecutiveFailures = consecutiveFailures;
   }
+  const lastAttemptAt = finiteNumber(parsed.lastAttemptAt);
+  if (lastAttemptAt !== undefined) {
+    entry.lastAttemptAt = lastAttemptAt;
+  }
   if (isCachedSnapshot(parsed.snapshot)) {
     entry.snapshot = parsed.snapshot;
   }
+  // An entry written before attempts were recorded: its reading's capture time
+  // is the last attempt. Taken here, before an invalidation can hide the reading.
+  entry.lastAttemptAt ??= finiteNumber(entry.snapshot?.capturedAt);
   return entry;
 }
 
