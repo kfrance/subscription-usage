@@ -16,6 +16,11 @@ export class LockError extends Error {
 export interface LockHandle {
   lockPath: string;
   release(): void;
+  /**
+   * True when this handle no longer owns the lock. Directory locks can be
+   * replaced after the stale window; `flock` handles omit this.
+   */
+  compromised?(): boolean;
 }
 
 /**

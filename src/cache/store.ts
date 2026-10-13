@@ -36,7 +36,10 @@ import { describeError, finiteNumber, isRecord } from "../lib/values.js";
  *
  * On a rate limit it also persists a `blockedUntil` deadline so the next command
  * skips the request entirely rather than spending another token from an empty
- * bucket, and a per-service lock keeps two processes from fetching at once.
+ * bucket, and a per-service lock keeps two processes from fetching at once. A
+ * provider may report `credentialRevision`. When that revision is newer than the
+ * last attempt, the backoff and the spacing no longer apply: the credentials the
+ * failure was about have been replaced.
  *
  * Every program on the machine that reads usage goes through here, so this is
  * also where live calls are spaced: no service is asked again within
@@ -299,8 +302,11 @@ export class CachingUsageProvider implements UsageProvider {
       }
       // A stale reading the caller accepts is already an answer; only an
       // unavailable one is worth waiting to replace. A rate-limit backoff that
-      // outlasts the wait is also final: no process calls during a backoff, so
-      // no newer reading can appear before it ends.
+      // outlasts the wait is also final for this call. Nothing calls the vendor
+      // during a backoff, so no newer reading appears before it ends. A
+      // credential file newer than the last attempt is not that backoff:
+      // attempt() ignores the deadline and the spacing, so the next call after
+      // the credentials are rewritten is not stuck behind the old limit.
       const now = this.now();
       const backoffOutlastsWait = attempt.blocked.unavailableKind === "rate-limited" && attempt.retryAt > deadline;
       if (attempt.blocked.refreshError !== undefined || backoffOutlastsWait || !(now < deadline)) {
@@ -322,9 +328,13 @@ export class CachingUsageProvider implements UsageProvider {
       return { done: stored };
     }
 
-    const blocked = this.whileBlocked(entry, decision, stored, now);
-    if (blocked) {
-      return blocked;
+    // A credential file newer than this attempt is not the backoff. The clear
+    // itself is written only after the cache lock is held.
+    if (!this.shouldClearBackoff(entry, now)) {
+      const blocked = this.whileBlocked(entry, decision, stored, now);
+      if (blocked) {
+        return blocked;
+      }
     }
 
     // Another process is already fetching this service. Joining it would be the
@@ -358,26 +368,37 @@ export class CachingUsageProvider implements UsageProvider {
       // That process may have taken a 429 and armed a backoff while we waited.
       // Re-checking under the lock is what makes the backoff shared: without it a
       // caller that always refreshes would ask the vendor again immediately and
-      // deepen the limit the other process just hit.
-      const blockedUnderLock = this.whileBlocked(
-        current,
-        lockedDecision,
-        currentSnapshot,
-        lockedNow,
-      );
-      if (blockedUnderLock) {
-        return blockedUnderLock;
+      // deepen the limit the other process just hit. A credential change is
+      // re-checked here too; the pre-lock check does not write the clear.
+      const clearBackoffUnderLock = this.shouldClearBackoff(current, lockedNow);
+      if (!clearBackoffUnderLock) {
+        const blockedUnderLock = this.whileBlocked(
+          current,
+          lockedDecision,
+          currentSnapshot,
+          lockedNow,
+        );
+        if (blockedUnderLock) {
+          return blockedUnderLock;
+        }
       }
 
       // Count the attempt before making it, so a reader stopped mid-request
-      // still holds every other process to the spacing.
-      this.writeEntry({ ...current, lastAttemptAt: lockedNow });
+      // still holds every other process to the spacing. A credential change
+      // drops the old backoff in that same write, so a crash mid-request does
+      // not put it back.
+      const remembered = clearBackoffUnderLock ? dropRateLimit(current) : current;
+      this.writeEntry({ ...remembered, lastAttemptAt: lockedNow });
       let snapshot: UsageSnapshot;
       try {
         snapshot = await this.inner.getUsage();
       } catch (error) {
         snapshot = unavailableSnapshot(this.service, describeError(error));
       }
+      // Stamp forward only for a credential write this provider just did. An
+      // external rewrite during the call stays newer than this stamp, so the
+      // next call can drop the backoff. See `attemptStamp`.
+      const attemptedAt = this.attemptStamp(lockedNow);
       this.logLiveCall(snapshot, lockedNow);
 
       if (snapshot.unavailableReason) {
@@ -395,19 +416,24 @@ export class CachingUsageProvider implements UsageProvider {
         // Only a rate limit changes what is stored beyond the attempt already
         // recorded; any other failure leaves the reading and backoff as they were.
         if (snapshot.unavailableKind === "rate-limited") {
-          const armed = this.recordRateLimit(snapshot, current, lockedNow);
+          const armed = this.recordRateLimit(snapshot, remembered, attemptedAt);
           return { blocked: result, retryAt: nextAllowedAt(armed) };
+        }
+        if (attemptedAt !== lockedNow) {
+          this.writeEntry({ ...remembered, lastAttemptAt: attemptedAt });
         }
         return { done: result };
       }
 
-      // Stamped when the request began, not when it returned. `record`
+      // `capturedAt` is when the request began, not when it returned. `record`
       // invalidates readings captured before a dispatch it could not measure, and
       // a request that started before that cutoff reflects pre-dispatch usage
       // however long it takes to come back. Stamping the completion time would
       // let such a reading land after the cutoff and be trusted for spending.
+      // `lastAttemptAt` may be later than that when this provider wrote the
+      // credential file during the attempt; see `attemptStamp`.
       const captured = { ...snapshot, capturedAt: lockedNow };
-      this.recordSuccess(captured);
+      this.recordSuccess(captured, attemptedAt);
       return { done: captured };
     } finally {
       lock.release();
@@ -505,8 +531,49 @@ export class CachingUsageProvider implements UsageProvider {
   }
 
   /** A success replaces the entry outright, which also clears the backoff. */
-  private recordSuccess(snapshot: UsageSnapshot): void {
-    this.writeEntry({ snapshot, lastAttemptAt: snapshot.capturedAt });
+  private recordSuccess(snapshot: UsageSnapshot, attemptedAt: number): void {
+    this.writeEntry({ snapshot, lastAttemptAt: attemptedAt });
+  }
+
+  /**
+   * Whether a live call is held back for credentials that have since been
+   * replaced. Checked only when a backoff or the spacing would otherwise block,
+   * so a fresh reading does not stat the credential file. The provider's answer
+   * is best-effort: a throw or a non-finite value leaves the backoff in place.
+   */
+  private shouldClearBackoff(entry: CacheEntry | undefined, now: number): boolean {
+    if (nextAllowedAt(entry) <= now) {
+      return false;
+    }
+    const attemptedAt = entry?.lastAttemptAt;
+    if (attemptedAt === undefined) {
+      return false;
+    }
+    const revision = this.readRevision(() => this.inner.credentialRevision?.());
+    return revision !== undefined && revision > attemptedAt;
+  }
+
+  /**
+   * `lastAttemptAt` after this attempt. It stays at the start unless this
+   * provider reports the mtime of a credential file it wrote during the call.
+   * Any other revision change is someone else's write and must stay newer than
+   * this stamp, so the next call clears the backoff.
+   */
+  private attemptStamp(startedAt: number): number {
+    const wrote = this.readRevision(() => this.inner.wroteCredentialRevision?.());
+    if (wrote === undefined) {
+      return startedAt;
+    }
+    return Math.max(startedAt, wrote);
+  }
+
+  /** A throw or a non-finite hook result is "no revision", not a failed read. */
+  private readRevision(read: () => number | undefined): number | undefined {
+    try {
+      return finiteNumber(read());
+    } catch {
+      return undefined;
+    }
   }
 
   /**
@@ -520,7 +587,7 @@ export class CachingUsageProvider implements UsageProvider {
    */
   private recordRateLimit(
     snapshot: UsageSnapshot,
-    previous: CacheEntry | undefined,
+    previous: Omit<CacheEntry, "version"> | undefined,
     attemptedAt: number,
   ): Omit<CacheEntry, "version"> {
     const failures = (previous?.consecutiveFailures ?? 0) + 1;
@@ -541,6 +608,24 @@ export class CachingUsageProvider implements UsageProvider {
   private writeEntry(state: Omit<CacheEntry, "version">): void {
     writeCacheEntry(this.entryPath(), state, this.writeFileAtomic, this.removeFile);
   }
+}
+
+/**
+ * The entry with the rate-limit backoff removed, so the next failure starts
+ * from zero. `JSON.stringify` would also drop an explicit `undefined`, but
+ * deleting the keys keeps a later spread from writing them back.
+ */
+function dropRateLimit(entry: CacheEntry | undefined): Omit<CacheEntry, "version"> | undefined {
+  if (entry === undefined) {
+    return undefined;
+  }
+  const {
+    version: _version,
+    blockedUntil: _blockedUntil,
+    consecutiveFailures: _consecutiveFailures,
+    ...rest
+  } = entry;
+  return rest;
 }
 
 /**

@@ -615,6 +615,177 @@ describe("CachingUsageProvider backoff", () => {
     expect(inner.calls).toBe(1);
     expect(again.unavailableReason).toContain("next read allowed in 60s");
   });
+
+  it("calls through a backoff when the credential revision is newer than the last attempt", async () => {
+    const inner = fakeInner([goodSnapshot(13)]);
+    inner.credentialRevision = () => T0 + 30_000;
+    const disk = fakeDisk(cacheFile({
+      snapshot: { ...goodSnapshot(42), capturedAt: T0 - 5 * MINUTE },
+      blockedUntil: T0 + 60 * MINUTE,
+      consecutiveFailures: 3,
+      lastAttemptAt: T0,
+    }));
+    const provider = makeProvider(inner, disk, { now: T0 + MINUTE, freshMs: 2 * MINUTE });
+
+    const snapshot = await provider.getUsage();
+
+    expect(inner.calls).toBe(1);
+    expect(snapshot.windows[0]?.usedPercent).toBe(13);
+    expect(disk.entry()?.blockedUntil).toBeUndefined();
+    expect(disk.entry()?.consecutiveFailures).toBeUndefined();
+    expect(disk.entry()?.lastAttemptAt).toBe(T0 + MINUTE);
+  });
+
+  it("ignores the 90s spacing when the credential revision is newer than the last attempt", async () => {
+    const inner = fakeInner([goodSnapshot(13)]);
+    inner.credentialRevision = () => T0 + 1;
+    const disk = fakeDisk(cacheFile({
+      snapshot: { ...goodSnapshot(42), capturedAt: T0 - 5 * MINUTE },
+      lastAttemptAt: T0,
+    }));
+    const provider = makeProvider(inner, disk, { now: T0 + 10_000, freshMs: 2 * MINUTE });
+
+    const snapshot = await provider.getUsage();
+
+    expect(inner.calls).toBe(1);
+    expect(snapshot.windows[0]?.usedPercent).toBe(13);
+    expect(disk.entry()?.lastAttemptAt).toBe(T0 + 10_000);
+  });
+
+  it("keeps the backoff when the credential revision is not newer", async () => {
+    const inner = fakeInner([goodSnapshot(13)]);
+    inner.credentialRevision = () => T0;
+    const disk = fakeDisk(cacheFile({
+      blockedUntil: T0 + 60 * MINUTE,
+      consecutiveFailures: 3,
+      lastAttemptAt: T0,
+    }));
+    const provider = makeProvider(inner, disk, { now: T0 + MINUTE, freshMs: 2 * MINUTE });
+
+    const snapshot = await provider.getUsage();
+
+    expect(inner.calls).toBe(0);
+    expect(snapshot.unavailableKind).toBe("rate-limited");
+    expect(disk.entry()?.consecutiveFailures).toBe(3);
+  });
+
+  it("keeps the backoff when reading the credential revision throws", async () => {
+    const inner = fakeInner([goodSnapshot(13)]);
+    inner.credentialRevision = () => {
+      throw new Error("stat failed secret-token");
+    };
+    const disk = fakeDisk(cacheFile({
+      blockedUntil: T0 + MINUTE,
+      lastAttemptAt: T0 - MINUTE,
+    }));
+    const provider = makeProvider(inner, disk, { freshMs: 2 * MINUTE });
+
+    const snapshot = await provider.getUsage();
+
+    expect(inner.calls).toBe(0);
+    expect(snapshot.unavailableReason).toContain("rate limited");
+    expect(JSON.stringify(snapshot)).not.toContain("secret-token");
+  });
+
+  it("does not let its own credential write clear the backoff it just stored", async () => {
+    let revision = T0 + 1_000;
+    let wrote: number | undefined;
+    const inner: UsageProvider & { calls: number } = {
+      service: "claude",
+      calls: 0,
+      credentialRevision: () => revision,
+      wroteCredentialRevision: () => wrote,
+      async getUsage() {
+        this.calls += 1;
+        wrote = undefined;
+        if (this.calls === 1) {
+          revision = T0 + 5_000;
+          wrote = T0 + 5_000;
+        }
+        return rateLimited;
+      },
+    };
+    const disk = fakeDisk();
+
+    await makeProvider(inner, disk, { freshMs: 2 * MINUTE }).getUsage();
+
+    expect(inner.calls).toBe(1);
+    expect(disk.entry()?.lastAttemptAt).toBe(T0 + 5_000);
+    expect(disk.entry()?.blockedUntil).toBe(T0 + MINUTE);
+    expect(disk.entry()?.consecutiveFailures).toBe(1);
+
+    const again = await makeProvider(inner, disk, { now: T0 + 10_000, freshMs: 2 * MINUTE }).getUsage();
+    expect(inner.calls).toBe(1);
+    expect(again.unavailableKind).toBe("rate-limited");
+
+    revision = T0 + 20_000;
+    await makeProvider(inner, disk, { now: T0 + 10_000, freshMs: 2 * MINUTE }).getUsage();
+    expect(inner.calls).toBe(2);
+    expect(disk.entry()?.consecutiveFailures).toBe(1);
+  });
+
+  it("clears a backoff when someone else rewrites credentials during the rate-limited read", async () => {
+    let revision = T0 + 1_000;
+    const inner: UsageProvider & { calls: number } = {
+      service: "claude",
+      calls: 0,
+      credentialRevision: () => revision,
+      async getUsage() {
+        this.calls += 1;
+        revision = T0 + 5_000;
+        return rateLimited;
+      },
+    };
+    const disk = fakeDisk();
+
+    await makeProvider(inner, disk, { freshMs: 2 * MINUTE }).getUsage();
+
+    expect(inner.calls).toBe(1);
+    expect(disk.entry()?.lastAttemptAt).toBe(T0);
+    expect(disk.entry()?.blockedUntil).toBe(T0 + MINUTE);
+
+    const again = await makeProvider(inner, disk, { now: T0 + 10_000, freshMs: 2 * MINUTE }).getUsage();
+    expect(inner.calls).toBe(2);
+    expect(again.unavailableKind).toBe("rate-limited");
+    expect(disk.entry()?.consecutiveFailures).toBe(1);
+    expect(disk.entry()?.lastAttemptAt).toBe(T0 + 10_000);
+  });
+
+  it("does not throw when the provider's own-write revision throws", async () => {
+    const inner = fakeInner([rateLimited]);
+    inner.wroteCredentialRevision = () => {
+      throw new Error("stat failed secret-token");
+    };
+    const disk = fakeDisk();
+
+    const snapshot = await makeProvider(inner, disk, { freshMs: 2 * MINUTE }).getUsage();
+
+    expect(inner.calls).toBe(1);
+    expect(snapshot.unavailableKind).toBe("rate-limited");
+    expect(JSON.stringify(snapshot)).not.toContain("secret-token");
+    expect(disk.entry()?.lastAttemptAt).toBe(T0);
+  });
+
+  it("serves a fresh reading without asking for the credential revision", async () => {
+    const inner = fakeInner([goodSnapshot(13)]);
+    let asked = false;
+    inner.credentialRevision = () => {
+      asked = true;
+      return T0 + 1;
+    };
+    const disk = fakeDisk(cacheFile({
+      snapshot: { ...goodSnapshot(42), capturedAt: T0 - 30_000 },
+      blockedUntil: T0 + 60 * MINUTE,
+      lastAttemptAt: T0 - 30_000,
+    }));
+    const provider = makeProvider(inner, disk, { freshMs: 2 * MINUTE });
+
+    const snapshot = await provider.getUsage();
+
+    expect(inner.calls).toBe(0);
+    expect(asked).toBe(false);
+    expect(snapshot.windows[0]?.usedPercent).toBe(42);
+  });
 });
 
 describe("CachingUsageProvider request collapsing", () => {

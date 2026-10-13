@@ -61,6 +61,19 @@ export interface UsageSnapshot {
 export interface UsageProvider {
   readonly service: UsageService;
   getUsage(): Promise<UsageSnapshot>;
+  /**
+   * Optional mtime, in epoch ms, of the credential file this provider reads.
+   * The cache drops a rate-limit backoff when this is newer than the last
+   * attempt: the credentials that failed have been replaced. Undefined when
+   * there is no credential file or it cannot be stat-ed.
+   */
+  credentialRevision?(): number | undefined;
+  /**
+   * Mtime of a credential file this provider itself wrote during the last
+   * `getUsage`. Absent when that call did not write one. The cache uses it so
+   * an external rewrite during the call is not mistaken for this write.
+   */
+  wroteCredentialRevision?(): number | undefined;
 }
 
 /**
